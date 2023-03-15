@@ -25,7 +25,7 @@ install: mconfig
 	$(MAKE) -C src install
 	$(MAKE) -C doc/manpages install
 	install -d ${DESTDIR}/${PREFIX}/bin
-	install -m755 seedrng /bin/seedrng
+	install -m755 seedrng ${DESTDIR}/${PREFIX}/bin/seedrng
 
 clean:
 	$(MAKE) -C src clean
