@@ -1,5 +1,7 @@
 # Makefile for Dinit.
 
+PREFIX ?=	/usr/local
+
 all: mconfig
 	$(MAKE) -C build all
 	$(MAKE) -C src all
@@ -22,7 +24,7 @@ run-cppcheck:
 install: mconfig
 	$(MAKE) -C src install
 	$(MAKE) -C doc/manpages install
-	install -d /bin
+	install -d ${DESTDIR}/${PREFIX}/bin
 	install -m755 seedrng /bin/seedrng
 
 clean:
