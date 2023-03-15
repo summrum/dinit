@@ -4,6 +4,7 @@ all: mconfig
 	$(MAKE) -C build all
 	$(MAKE) -C src all
 	$(MAKE) -C doc/manpages all
+	$(CC) $(CFLAGS) seedrng.c -o seedrng $(LDFLAGS)
 	@echo "***"
 	@echo "*** Build complete; use \"make check\" to run unit tests, \"make check-igr\" for"
 	@echo "*** integration tests, or \"make install\" to install."
@@ -21,6 +22,8 @@ run-cppcheck:
 install: mconfig
 	$(MAKE) -C src install
 	$(MAKE) -C doc/manpages install
+	install -d /bin
+	install -m755 seedrng /bin/seedrng
 
 clean:
 	$(MAKE) -C src clean
