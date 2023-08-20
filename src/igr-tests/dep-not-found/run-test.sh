@@ -4,25 +4,16 @@
 #
 
 set -eu
-
 cd "$(dirname "$0")"
+. ../igr_functions.sh
 
-"$DINIT_EXEC" -d sd -u -p socket -q &
-DINITPID=$!
+spawn_dinit
 
-# Give some time for startup
-sleep 0.2
-
-STATUS=PASS
-
-DINITCTLOUT="$("$DINITCTL_EXEC" -p socket start missing-dep-svc 2>&1 || true)"
-if [ "$DINITCTLOUT" != "$(cat output.expected)" ]; then
-    echo "$DINITCTLOUT" > output.actual
-    STATUS=FAIL
+if ! compare_cmd "run_dinitctl start missing-dep-svc" "output.expected" err; then
+    echo "$CMD_OUT" > "$IGR_OUTPUT"/output.actual
+    error "'dinitctl start missing-dep-svc 2>&1' didn't contain expected result!" "Check $IGR_OUTPUT/output.actual"
 fi
 
-"$DINITCTL_EXEC" --quiet -p socket shutdown
-wait $DINITPID
+stop_dinit
 
-if [ $STATUS = PASS ]; then exit 0; fi
-exit 1
+exit 0

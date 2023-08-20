@@ -67,8 +67,24 @@ int main(int argc, char **argv)
     if (vars.find("USE_UTMPX") != vars.end()) {
         cout << "#define USE_UTMPX " << vars["USE_UTMPX"] << "\n";
     }
+    if (vars.find("USE_INITGROUPS") != vars.end()) {
+        cout << "#define USE_INITGROUPS " << vars["USE_INITGROUPS"] << "\n";
+    }
+    else {
+    	// Default to assuming initgroups(3) is available
+    	cout << "#define USE_INITGROUPS 1\n";
+    }
     if (vars.find("SUPPORT_CGROUPS") != vars.end()) {
         cout << "#define SUPPORT_CGROUPS " << vars["SUPPORT_CGROUPS"] << "\n";
+    }
+    if (vars.find("DEFAULT_AUTO_RESTART") != vars.end()) {
+	cout << "#define DEFAULT_AUTO_RESTART " << vars["DEFAULT_AUTO_RESTART"] << "\n";
+    }
+    if (vars.find("DEFAULT_START_TIMEOUT") != vars.end()) {
+	cout << "#define DEFAULT_START_TIMEOUT " << vars["DEFAULT_START_TIMEOUT"] << "\n";
+    }
+    if (vars.find("DEFAULT_STOP_TIMEOUT") != vars.end()) {
+    cout << "#define DEFAULT_STOP_TIMEOUT " << vars["DEFAULT_STOP_TIMEOUT"] << "\n";
     }
 
     cout << "\n// Constants\n";

@@ -1,18 +1,15 @@
 #!/bin/sh
 
+set -eu
 cd "$(dirname "$0")"
+. ../igr_functions.sh
 
-rm -f ./basic-ran
+rm -f "$IGR_OUTPUT"/basic-ran
 
-"$DINIT_EXEC" -d sd -u -p socket -q \
-	basic
+spawn_dinit_oneshot basic
 
-STATUS=FAIL
-if [ -e basic-ran ]; then
-   if [ "$(cat basic-ran)" = "ran" ]; then
-       STATUS=PASS
-   fi
+if ! compare_text "$IGR_OUTPUT"/basic-ran "ran"; then
+    error "$IGR_OUTPUT/basic-ran didn't contain expected result!"
 fi
 
-if [ $STATUS = PASS ]; then exit 0; fi
-exit 1
+exit 0

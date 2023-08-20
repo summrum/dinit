@@ -41,6 +41,12 @@ option(
     description : 'Whether to build support for manipulating the utmp/utmpx database via the related POSIX functions.'
 )
 option(
+    'use-initgroups',
+    type : 'boolean',
+    value : true,
+    description : 'Whether to use initgroups to initialize supplementary groups for run-as services.'
+)
+option(
     'dinit-sbindir',
     type : 'string',
     value : '/sbin',
@@ -51,6 +57,24 @@ option(
     type : 'boolean',
     value : true,
     description : 'Building & installing man-pages.'
+)
+option(
+    'default-auto-restart',
+    type : 'boolean',
+    value : true,
+    description : 'Enable/disable auto-restart for services by default.'
+)
+option(
+    'default-start-timeout',
+    type : 'integer',
+    value : 60,
+    description : 'Default start-timeout for services in seconds'
+)
+option(
+    'default-stop-timeout',
+    type : 'integer',
+    value : 10,
+    description : 'Default stop-timeout for services in seconds'
 )
 
 ## Linux specific options

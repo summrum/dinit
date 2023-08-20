@@ -17,9 +17,9 @@ of the file corresponds to the name of the service it describes.
 Service description files specify the various attributes of a service. A
 service description file is named after the service it represents, and is
 a plain-text file with simple key-value format.
-The description files are located in a service description directory; by default,
-the system process searches \fI/etc/dinit.d\fR, \fI/usr/local/lib/dinit.d\fR and
-\fI/lib/dinit.d\fR, while a user process searches \fI$HOME/.config/dinit.d\fR.
+The description files are located in a service description directory;
+See \fBdinit\fR(8) for more details of the default service description directories,
+and how and when service descriptions are loaded.
 .LP
 All services have a \fItype\fR and a set of \fIdependencies\fR. These are discussed
 in the following subsections. The type, dependencies, and other attributes are
@@ -119,14 +119,19 @@ Values are interpreted literally, except that:
 White space (comprised of spaces, tabs, etc) is collapsed to a single space, except
 leading or trailing white space around the property value, which is stripped.
 .IP \(bu
+For settings which specify a command with arguments, the value is interpreted as a
+series of tokens separated by white space, rather than a single string of characters. 
+.IP \(bu
 Double quotes (") can be used around all or part of a property value, to
 prevent whitespace collapse and prevent interpretation of other special
 characters (such as "#") inside the quotes.
 The quote characters are not considered part of the property value.
+White space appearing inside quotes does not act as a delimiter for tokens.
 .IP \(bu
 A backslash (\\) can be used to escape the next character, causing it to
 lose any special meaning and become part of the property value.
 A double backslash (\\\\) is collapsed to a single backslash within the parameter value.
+White space preceded by a backslash will not separate tokens.
 .LP
 Setting a property generally overrides any previous setting (from prior lines).
 However some properties are set additively; these include dependency relationships and \fBoptions\fR
@@ -140,11 +145,13 @@ Specifies the service type; see the \fBSERVICE TYPES\fR section.
 \fBcommand\fR = \fIcommand-string\fR
 Specifies the command, including command-line arguments, for starting the process.
 Applies only to \fBprocess\fR, \fBbgprocess\fR and \fBscripted\fR services.
+The value is subject to variable substitution (see \fBVARIABLE SUBSTITUTION\fR).
 .TP
 \fBstop\-command\fR = \fIcommand-string\fR
 Specifies the command to stop the service (optional). Applicable to \fBprocess\fR, \fBbgprocess\fR and
 \fBscripted\fR services.  If specified for \fBprocess\fR or \fBbgprocess\fR services, the "stop
 command" will be executed in order to stop the service, instead of signalling the service process. 
+The value is subject to variable substitution (see \fBVARIABLE SUBSTITUTION\fR).
 .TP
 \fBworking\-dir\fR = \fIdirectory\fR
 Specifies the working directory for this service. For a scripted service, this
@@ -155,26 +162,29 @@ The value is subject to variable substitution (see \fBVARIABLE SUBSTITUTION\fR).
 Specifies which user to run the process(es) for this service as.
 Specify as a username or numeric ID.
 If specified by name, the group for the process will also be set to the primary
-group of the specified user.
+group of the specified user, and supplementary groups will be initialised (unless support
+for them is disabled) according to the system's group database.
+If specified by number, the group for the process will remain the same as that of the
+running \fBdinit\fR process, and all supplementary groups will be dropped (unless support
+has been disabled).
 .TP
 \fBenv\-file\fR = \fIfile\fR
 Specifies a file containing value assignments for environment variables, in the same
-format recognised by the \fBdinit\fR command's \fB\-\-env\-file\fR option (see \fBdinit\fR(5)).
-The file is read (or re-read) whenever the service is started; the values read do not
-affect for the processing performed for the \fBsub\-vars\fR load option, which is done
-when the service description is loaded.
-The precise behaviour of this setting may change in the future.
-It is recommended to avoid depending on the specified file contents being reloaded
-whenever the service process starts.
-.sp
-The path specified is subject to variable substitution (see \fBVARIABLE SUBSTITUTION\fR).
+format recognised by the \fBdinit\fR command's \fB\-\-env\-file\fR option (see \fBdinit\fR(8)).
+The file is read when the service is loaded, therefore values from it can be used in variable
+substitutions (see \fBVARIABLE SUBSTITUTION\fR).
+Variable substitution is not performed on the \fBenv\-file\fR property value itself.
 .TP
 \fBrestart\fR = {yes | true | no | false}
 Indicates whether the service should automatically restart if it stops, including due to
 unexpected process termination or a dependency stopping.
 Note that if a service stops due to user request, automatic restart is inhibited.
-The default is to automatically restart.
-.TP
+$$$changequote(`,')dnl
+ifelse(DEFAULT_AUTO_RESTART, true,
+    ``The default is to automatically restart.'',
+    ``The default is to not automatically restart.'')
+changequote(`@@@',`$$$')dnl
+@@@.TP
 \fBsmooth\-recovery\fR = {yes | true | no | false}
 Applies only to \fBprocess\fR and \fBbgprocess\fR services.
 When set true/yes, an automatic process restart can be performed without first stopping any
@@ -205,17 +215,17 @@ If the service takes longer than this, its process group is sent a SIGINT signal
 and enters the "stopping" state (this may be subject to a stop timeout, as
 specified via \fBstop\-timeout\fR, after which the process group will be
 terminated via SIGKILL).
-The timeout period begins only when all dependencies have been stopped.
-The default timeout is 60 seconds.
-Specify a value of 0 to allow unlimited start time.
+The timeout period begins only when all dependencies have been satisfied.
+The default value is $$$DEFAULT_START_TIMEOUT@@@.
+A value of 0 allows unlimited start time.
 .TP
 \fBstop\-timeout\fR = \fIXXX.YYY\fR
 Specifies the time in seconds allowed for the service to stop.
 If the service takes longer than this, its process group is sent a SIGKILL signal
 which should cause it to terminate immediately.
 The timeout period begins only when all dependent services have already stopped.
-The default timeout is 10 seconds.
-Specify a value of 0 to allow unlimited stop time.
+The default value is $$$DEFAULT_STOP_TIMEOUT@@@.
+A value of 0 allows unlimited stop time.
 .TP
 \fBpid\-file\fR = \fIpath-to-file\fR
 For \fBbgprocess\fR type services only; specifies the path of the file where
@@ -265,12 +275,15 @@ When starting this service, if the named service is also starting, wait for the 
 to finish starting before bringing this service up. This is similar to a \fBwaits\-for\fR
 dependency except no dependency relationship is implied; if the named service is not starting,
 starting this service will not cause it to start (nor wait for it in that case).
+It does not by itself cause the named service to be loaded (if loaded later, the "after"
+relationship will be enforced from that point).
 .TP
 \fBbefore\fR = \fIservice-name\fR
 When starting the named service, if this service is also starting, wait for this service
 to finish starting before bringing the named service up. This is largely equivalent to specifying
-an \fBafter\fR relationship to this service in the named service (but the relationship "belongs"
-to this service and so will be removed if this service is unloaded, for example).
+an \fBafter\fR relationship to this service from the named service.
+However, it does not by itself cause the named service to be loaded (if loaded later, the "before"
+relationship will be enforced from that point).
 .TP
 \fBchain\-to\fR = \fIservice-name\fR
 When this service terminates (i.e. starts successfully, and then stops of its
@@ -311,7 +324,7 @@ The default is 666.
 .TP
 \fBsocket\-uid\fR = {\fInumeric-user-id\fR | \fIusername\fR}
 Specifies the user (name or numeric ID) that should own the activation socket.
-If \fBsocket\-uid\fR is specified as a name without also specifying \fBsocket-gid\fR, then
+If \fBsocket\-uid\fR is specified as a name without also specifying \fBsocket\-gid\fR, then
 the socket group is the primary group of the specified user (as found in the
 system user database, normally \fI/etc/passwd\fR).
 If the \fBsocket\-uid\fR setting is not provided, the socket will be owned by the user id of the \fBdinit\fR process.
@@ -319,11 +332,14 @@ If the \fBsocket\-uid\fR setting is not provided, the socket will be owned by th
 \fBsocket\-gid\fR = {\fInumeric-group-id\fR | \fIgroup-name\fR}
 Specifies the group of the activation socket. See discussion of \fBsocket\-uid\fR.
 .TP
-\fBterm\-signal\fR = {none | HUP | INT | TERM | QUIT | USR1 | USR2 | KILL}
-Specifies the signal to send to the process when requesting it
-to terminate (applies to `process' and `bgprocess' services only).
-The default is SIGTERM.
-See also \fBstop\-timeout\fR.
+\fBterm\-signal\fR = {\fBnone\fR | \fIsignal-name\fR}
+Specifies the signal to send to the process when requesting it to terminate (applies to `process'
+and `bgprocess' services only).
+Signal names are specified as the POSIX signal name without the \fBSIG\fR- prefix.
+At least \fBHUP\fR, \fBTERM\fR, and \fBKILL\fR are supported (use \fBdinitctl signal \-\-list\fR
+for the full list of supported signals).
+The default is TERM (the SIGTERM signal).
+See also the discussion of \fBstop\-timeout\fR.
 .TP
 \fBready\-notification\fR = {\fBpipefd:\fR\fIfd-number\fR | \fBpipevar:\fR\fIenv-var-name\fR}
 Specifies the mechanism, if any, by which a process service will notify that it is ready
@@ -341,12 +357,72 @@ using the contents of the specified environment variable, which will be set by \
 execution to a file descriptor (chosen arbitrarily) attached to the write end of a pipe.
 .RE
 .TP
+\fBlog\-type\fR = {file | buffer | pipe | none}
+Specifies how the output of this service is logged.
+This setting is valid only for process-based services (including \fBscripted\fR services).
+.RS
+.IP \(bu
+\fBfile\fR: output will be written to a file; see the \fBlogfile\fR setting.
+.IP \(bu
+\fBbuffer\fR: output will be buffered in memory, up to a limit specified via the
+\fBlog\-buffer\-size\fR setting.
+The buffer contents can be examined via the \fBdinitctl\fR(8) \fBcatlog\fR subcommand. 
+.IP \(bu
+\fBpipe\fR: output will be written to a pipe, and may be consumed by another service
+(see the \fBconsumer\-of\fR setting); note that, if output is not consumed promptly, the pipe buffer
+may become full which may cause the service process to stall.
+.IP \(bu
+\fBnone\fR: output is discarded.
+.RE
+.IP
+The default log type is \fBnone\fR, unless the \fBlogfile\fR setting is specified in which case
+the default log type is \fBfile\fR. For \fBpipe\fR (and \fBbuffer\fR, which uses a pipe internally)
+note that the pipe created may outlive the service process and be re-used if the service is stopped
+and restarted.
+.\"
+.TP
 \fBlogfile\fR = \fIlog-file-path\fR
 Specifies the log file for the service.
-Output from the service process (standard output and standard error streams) will be appended to this file.
+Output from the service process (standard output and standard error streams) will be appended to this file,
+which will be created if it does not already exist. The file ownership and permissions are adjusted
+according to the \fBlogfile\-uid\fR, \fBlogfile\-gid\fR and \fBlogfile\-permissions\fR settings.
 This setting has no effect if the service is set to run on the console (via the \fBruns\-on\-console\fR,
 \fBstarts\-on\-console\fR, or \fBshares\-console\fR options).
 The value is subject to variable substitution (see \fBVARIABLE SUBSTITUTION\fR).
+Note that if the directory in which the logfile resides does not exist (or is not otherwise accessible to
+\fBdinit\fR) when the service is started, the service will not start successfully.
+If this settings is specified and \fBlog\-type\fR is not specified or is currently \fBnone\fR, then
+the log type will be changed to \fBfile\fR.
+.TP
+\fBlogfile\-permissions\fR = \fIoctal-permissions-mask\fR
+Gives the permissions for the log file specified using \fBlogfile\fR. Normally this will be 600 (user access
+only), 640 (also readable by the group), or 644 (readable by all users).
+If the log file already exists when the service starts, its permissions will be changed in accordance with
+the value of this setting.
+The default is value 600 (accessible to only the owning user).
+.TP
+\fBlogfile\-uid\fR = {\fInumeric-user-id\fR | \fIusername\fR}
+Specifies the user (name or numeric ID) that should own the log file.
+If \fBlogfile\-uid\fR is specified as a name without also specifying \fBlogfile\-gid\fR, then
+the log file group is the primary group of the specified user (as found in the
+system user database, normally \fI/etc/passwd\fR).
+If the log file already exists when the service starts, its ownership will be changed in accordance with
+the value of this setting.
+The default value is the user id of the \fBdinit\fR process.
+.TP
+\fBlogfile\-gid\fR = {\fInumeric-group-id\fR | \fIgroup-name\fR}
+Specifies the group of the log file. See discussion of \fBlogfile\-uid\fR.
+.TP
+\fBlog\-buffer\-size\fR = \fIsize-in-bytes\fR
+If the log type (see \fBlog\-type\fR) is set to \fBbuffer\fR, this setting controls the maximum
+size of the buffer used to store process output. If the buffer becomes full, further output from
+the service process will be discarded.
+.TP
+\fBconsumer\-of\fR = \fIservice-name\fR
+Specifies that this service consumes (as its standard input) the output of another service.
+For example, this allows this service to act as a logging agent for another service.
+The named service must be a process-based service with \fBlog\-type\fR set to \fBpipe\fR.
+This setting is only valid for \fBprocess\fR and \fBbgprocess\fR services.
 .TP
 \fBoptions\fR = \fIoption\fR...
 Specifies various options for this service. See the \fBOPTIONS\fR section.
@@ -354,18 +430,14 @@ This directive can be specified multiple times to set additional options.
 .TP
 \fBload\-options\fR = \fIload_option\fR...
 Specifies options for interpreting other settings when loading this service description.
-Currently there is only one available option, \fBsub\-vars\fR, which specifies that command-line arguments
-(or parts thereof) in the form of \fB$NAME\fR should be replaced with the contents of the
-environment variable with the specified name.
-See \fBVARIABLE SUBSTITUTION\fR for details.
-Note command-line variable substitution occurs after splitting the line into separate arguments and so
-a single environment variable cannot be used to add multiple arguments to a command line.
-If a designated variable is not defined, it is replaced with an empty (zero-length) string, possibly producing a
-zero-length argument.
-Environment variable variables are taken from the environment of the \fBdinit\fR process, and values
-specified via \fBenv\-file\fR or \fBready\-notification\fR are not available.
-This functionality is likely to be re-worked or removed in the future; use of this option should
-be avoided if possible.
+Currently there are two available options. One is \fBexport-passwd-vars\fR, which
+specifies that the environment variables `\fBUSER\fR', `\fBLOGNAME\fR' (same as
+`\fBUSER\fR'), `\fBHOME\fR', `\fBSHELL\fR', `\fBUID\fR', and `\fBGID\fR' should
+be exported into the service's load environment (that is, overriding any global
+environment including the global environment file, but being overridable by the
+service's environment file). The other is \fBexport-service-name\fR, which will
+set the environment variable `\fBDINIT_SERVICE\fR' containing the name of the
+current service.
 .TP
 \fBinittab\-id\fR = \fIid-string\fR
 When this service is started, if this setting (or the \fBinittab\-line\fR setting) has a
@@ -387,7 +459,7 @@ However, "who" and similar utilities may not work correctly without this setting
 (or \fBinittab\-line\fR) enabled appropriately.
 .sp
 This setting has no effect if Dinit was not built with support for writing to the "utmp"
-database.
+database. It applies only to \fBprocess\fR services.
 .TP
 \fBinittab\-line\fR = \fItty-name-string\fR
 This specifies the tty line that will be written to the "utmp" database when this service
@@ -442,7 +514,7 @@ These options are specified via the \fBoptions\fR parameter.
 .TP
 \fBruns\-on\-console\fR
 Specifies that this service uses the console; its input and output should be
-directed to the console (or precisely, to the device to which Dinit's standard
+directed to the console (or precisely, to the device to which \fBdinit\fR's standard
 output stream is connected).
 A service running on the console prevents other services from running on the
 console (they will queue for the console).
@@ -451,10 +523,10 @@ Proper operation of this option (and related options) assumes that \fBdinit\fR
 is itself attached correctly to the console device (or a terminal, in which case
 that terminal will be used as the "console").
 .sp
-The \fIinterrupt\fR key (normally control-C) will be active for process / scripted
-services that run on the console.
-Handling of an interrupt is determined by the service process, but typically will
-cause it to terminate.
+The \fIinterrupt\fR key (normally control-C) may be active for process / scripted
+services that run on the console, depending on terminal configuration and operating-system
+specifics.
+The interrupt signal (SIGINT), however, is masked by default (but see \fBunmask\-intr\fR).
 .TP
 \fBstarts\-on\-console\fR
 Specifies that this service uses the console during service startup.
@@ -476,12 +548,33 @@ This is mutually exclusive with both \fBstarts\-on\-console\fR and \fBruns\-on\-
 setting this option unsets both those options, and setting either of those options unsets
 this option.
 .TP
+\fBunmask\-intr\fR
+For services that run or start on the console, specifies that the terminal interrupt signal
+(SIGINT, normally invoked by control-C) should be unmasked.
+Handling of an interrupt is determined by the service process, but typically will
+cause it to terminate.
+This option may therefore be used to allow a service to be terminated by the user via
+a keypress combination.
+In combination with \fBskippable\fR, it may allow service startup to be skipped.
+.sp
+A service with this option will typically also have the \fBstart\-interruptible\fR option
+set.
+.sp
+Note that whether an interrupt can be generated, and the key combination required to do so,
+depends on the operating system's handling of the console device and, if it is a terminal,
+how the terminal is configured; see \fBstty\fR(1).
+.sp
+Note also that a process may choose to mask or unmask the interrupt signal of its own accord,
+once it has started.
+Shells, in particular, may unmask the signal; it might not be possible to reliably run a shell
+script on the console without allowing a user to interrupt it.
+.TP
 \fBstarts\-rwfs\fR
 This service mounts the root filesystem read/write (or at least mounts the
 normal writable filesystems for the system).
 This prompts Dinit to attempt to create its control socket, if it has not already managed to do so,
 and similarly log boot time to the system \fBwtmp\fR(5) database (if supported) if not yet done.
-This option may be specified on multiple services, which may be useful if the wtmp database becomes
+This option may be specified on multiple services, which may be useful if the \fBwtmp\fR database becomes
 writable at a different stage than the control socket location becomes writable, for example.
 If the control socket has already been created, this option currently causes Dinit to check that
 the socket "file" still exists and re-create it if not. It is not recommended to rely on this
@@ -503,8 +596,9 @@ You should not use this option unless the service is designed to receive a Dinit
 control socket.
 .TP
 \fBstart\-interruptible\fR
-This service can have its startup interrupted (cancelled) if it becomes inactive
-while still starting, by sending it the SIGINT signal.
+Indicates that this service can have its startup interrupted (cancelled), by sending it the SIGINT signal.
+If service state changes such that this service will stop, but it is currently starting, and this option
+is set, then Dinit will attempt to interrupt it rather than waiting for its startup to complete.
 This is meaningful only for \fBbgprocess\fR and \fBscripted\fR services.
 .TP
 \fBskippable\fR
@@ -574,12 +668,41 @@ For these properties, the specified value may contain one or more environment
 variable names, each preceded by a single `\fB$\fR' character, as in `\fB$NAME\fR'.
 In each case the value of the named environment variable will be substituted.
 The name must begin with a non-punctuation, non-space, non-digit character, and ends
-before the first control character, space, or punctuation character other than `\fB.\fR',
-`\fB\-\fR' or `\fB_\fR'.
+before the first control character, space, or punctuation character other than `\fB_\fR'.
 To avoid substitution, a single `\fB$\fR' can be escaped with a second, as in `\fB$$\fR'.
-.sp
-Variables for substitution come from the \fBdinit\fR environment at the time the service is loaded.
-In particular, variables set via \fBenv\-file\fR are not visible to the substitution function.
+.P
+Variable substitution also supports a limited subset of shell syntax. You can use curly
+braces to enclose the variable, as in `\fB${NAME}\fR'.
+Limited parameter expansion is also supported, specifically the forms `\fB${NAME:\-word}\fR'
+(substitute `\fBword\fR' if variable is unset or empty), `\fB${NAME\-word}\fR' (substitute
+`\fBword\fR' if variable is unset), `\fB${NAME:+word}\fR' (substitute `\fBword\fR' if variable is
+set and non\-empty), and `\fB${NAME+word}\fR' (substitute `\fBword\fR' if variable is set).
+Unlike in shell expansion, the substituted \fBword\fR does not itself undergo expansion and
+cannot contain closing brace characters or whitespace, even if quoted.
+.P
+Note command-line variable substitution occurs after splitting the line into separate arguments and so
+a single environment variable cannot be used to add multiple arguments to a command line.
+If a designated variable is not defined, it is replaced with an empty (zero-length) string, possibly producing a
+zero-length argument.
+.P
+Variable substitution occurs when the service is loaded.
+Therefore, it is typically not useful for dynamically changing service parameters (including
+command line) based on a variable that is inserted into \fBdinit\fR's environment once it is
+running (for example via \fBdinitctl setenv\fR). 
+.P
+The effective environment for variable substitution in setting values matches the environment supplied to the process
+for a service when it is launched. The priority of environment variables, from highest to lowest, for both is:
+.IP \(bu
+variables from the service \fBenv\-file\fR
+.IP \(bu
+variables set by the \fBexport\-passwd\-vars\fR and \fBexport\-service\-name\fR load options
+.IP \(bu
+the process environment of \fBdinit\fR (which is established on launch by the process environment of the
+parent, amended by loading the environment file (if any) as specified in \fBdinit\fR(8), and further
+amended via \fBdinitctl setenv\fR commands or equivalent).
+.P
+Note that since variable substitution is performed on service load, the values seen by a service process may differ from those
+used for substitution, if they have been changed in the meantime.
 .\"
 .SH EXAMPLES
 .LP
@@ -604,7 +727,7 @@ depends-on = rcboot # Basic system services must be ready
 .fi
 .LP
 Here is an examples for a filesystem check "service", run by a script
-(\fI/etc/dinit.d/rootfscheck.sh\fR).
+(\fI/etc/dinit.d/scripts/rootfscheck.sh\fR).
 The script may need to reboot the system, but the control socket may not have been
 created, so it uses the \fBpass-cs-fd\fR option to allow the \fBreboot\fR command
 to issue control commands to Dinit.
@@ -617,7 +740,7 @@ using control-C, in which case the check is skipped but dependent services conti
 .ft CR
 # rootfscheck service
 type = scripted
-command = /etc/dinit.d/rootfscheck.sh
+command = /etc/dinit.d/scripts/rootfscheck.sh
 restart = false
 options = starts-on-console pass-cs-fd
 options = start-interruptible skippable

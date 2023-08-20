@@ -30,7 +30,7 @@ This is currently fully supported only on Linux.
 See \fBRUNNING AS SYSTEM MANAGER / PRIMARY INIT\fR.
 .LP
 Dinit reads service descriptions from files located in a service
-description directory, normally one of \fI/etc/dinit.d\fR,
+description directory, normally one of \fI/etc/dinit.d\fR, \fI/run/dinit.d\fR,
 \fI/usr/local/lib/dinit.d\fR or \fI/lib/dinit.d\fR for the system instance
 or just \fI$HOME/.config/dinit.d\fR when run as a user process.
 See \fBSERVICE DESCRIPTION FILES\fR for details of the service description format.
@@ -43,8 +43,8 @@ This can be specified multiple times for multiple service directories.
 The default directories are not searched for services when this option is provided.
 .sp
 If not specified, the default is \fI$HOME/.config/dinit.d\fR or, for the
-system service manager, each of \fI/etc/dinit.d\fR, \fI/usr/local/lib/dinit.d\fR,
-and \fI/lib/dinit.d\fR (searched in that order).
+system service manager, each of \fI/etc/dinit.d\fR, \fI/run/dinit.d/\fR,
+\fI/usr/local/lib/dinit.d\fR, and \fI/lib/dinit.d\fR (searched in that order).
 .TP
 \fB\-e\fR \fIfile\fP, \fB\-\-env\-file\fR \fIfile\fP
 Read initial environment from \fIfile\fP.
@@ -125,12 +125,16 @@ See the \fBCOMMAND LINE FROM KERNEL\fR section.
 .SH SERVICE DESCRIPTION FILES
 .\"
 Service description files specify the parameters of each service.
-They are named for the service they describe, and are found in \fI/etc/dinit.d\fR
-for a system instance or \fI$HOME/.config/dinit.d\fR for a user instance.
+They are named for the service they describe, and are found in one of several directories
+(including \fI/etc/dinit.d\fR) for a system instance or \fI$HOME/.config/dinit.d\fR for a user instance
+(see also \fB\-\-services\-dir\fR option).
 .LP
 Service description files are read by Dinit on an "as needed" basis.
-Once a service description has been read the configuration can be altered or reloaded via the
-\fBdinitctl\fR(8) program (with some limitations).
+Once loaded, a service description is never automatically unloaded (even if the service
+stops or fails).
+A service description can however be unloaded (if the service is stopped) or reloaded
+(with some limitations) via \fBdinitctl\fR(8) using the \fBunload\fR and \fBreload\fR subcommands
+respectively.
 .LP
 See \fBdinit-service\fR(5) for details of the format and available parameters.
 .\"
@@ -234,6 +238,12 @@ value from the original environment.
 Imports the value of the named variables from the original environment, overriding the effect of any
 value set previously as well as the effect of previous \fB!unset\fR and \fB!clear\fR commands.
 .RE
+.TP
+\fI/etc/dinit.d\fR, \fI/run/dinit.d\fR, \fI/usr/local/lib/dinit.d\fR, \fI/lib/dinit.d\fR
+Default locations for service description files. The directories are searched in the order listed.
+.TP
+\fI$HOME/.config/dinit.d\fR
+Default location for service description files for user instances. 
 .\"
 .SH SIGNALS
 .LP

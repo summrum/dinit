@@ -13,13 +13,20 @@
 
 #include "service.h"
 #include "proc-service.h"
+#include "mconfig.h"
 
 #ifdef SUPPORT_CGROUPS
 extern std::string cgroups_path;
 extern bool have_cgroups_path;
 #endif
 
-// Move an fd, if necessary, to another fd. The destination fd must be available (not open).
+#if USE_INITGROUPS
+#include <grp.h>
+#endif
+
+extern sigset_t orig_signal_mask;
+
+// Move an fd, if necessary, to another fd. The original destination fd will be closed.
 // if fd is specified as -1, returns -1 immediately. Returns 0 on success.
 static int move_fd(int fd, int dest)
 {
@@ -65,19 +72,14 @@ void base_process_service::run_child_proc(run_proc_params params) noexcept
 
     // If the console already has a session leader, presumably it is us. On the other hand
     // if it has no session leader, and we don't create one, then control inputs such as
-    // ^C will have no effect.
-    bool do_set_ctty = (tcgetsid(0) == -1);
+    // ^C will have no effect. (We check here, before we potentially re-assign STDIN).
+    bool do_set_ctty = on_console && (tcgetsid(0) == -1);
 
-    // Copy signal mask, but unmask signals that we masked on startup. For the moment, we'll
-    // also block all signals, since apparently dup() can be interrupted (!!! really, POSIX??).
-    sigset_t sigwait_set;
+    // For the moment, we'll block all signals, since apparently even dup() can be interrupted
+    // (thanks, POSIX...).
     sigset_t sigall_set;
     sigfillset(&sigall_set);
-    sigprocmask(SIG_SETMASK, &sigall_set, &sigwait_set);
-    sigdelset(&sigwait_set, SIGCHLD);
-    sigdelset(&sigwait_set, SIGINT);
-    sigdelset(&sigwait_set, SIGTERM);
-    sigdelset(&sigwait_set, SIGQUIT);
+    sigprocmask(SIG_SETMASK, &sigall_set, nullptr);
 
     constexpr int bufsz = 11 + ((CHAR_BIT * sizeof(pid_t) + 2) / 3) + 1;
     // "LISTEN_PID=" - 11 characters; the expression above gives a conservative estimate
@@ -89,13 +91,19 @@ void base_process_service::run_child_proc(run_proc_params params) noexcept
     constexpr int csenvbufsz = 12 + ((CHAR_BIT * sizeof(int) - 1 + 2) / 3) + 1;
     char csenvbuf[csenvbufsz];
 
-    environment proc_env;
     environment::env_map proc_env_map;
 
     run_proc_err err;
     err.stage = exec_stage::ARRANGE_FDS;
 
+    // We need to shuffle various file descriptors around to get them in the right places.
+
     int minfd = (socket_fd == -1) ? 3 : 4;
+
+    // If input_fd is set, deal with it now (move it to STDIN) so we can throw away that file descriptor
+    if (params.input_fd != -1) {
+        if (move_fd(params.input_fd, STDIN_FILENO) != 0) goto failure_out;
+    }
 
     if (force_notify_fd != -1) {
         // Move wpipefd/csfd/socket_fd to another fd if necessary:
@@ -143,12 +151,6 @@ void base_process_service::run_child_proc(run_proc_params params) noexcept
     }
 
     try {
-        // Read environment from file
-        if (params.env_file != nullptr && *params.env_file != 0) {
-            err.stage = exec_stage::READ_ENV_FILE;
-            read_env_file(params.env_file, false, proc_env);
-        }
-
         // Set up notify-fd variable:
         if (notify_var != nullptr && *notify_var != 0) {
             err.stage = exec_stage::SET_NOTIFYFD_VAR;
@@ -159,7 +161,7 @@ void base_process_service::run_child_proc(run_proc_params params) noexcept
             char * var_str = (char *) malloc(req_sz);
             if (var_str == nullptr) goto failure_out;
             snprintf(var_str, req_sz, "%s=%d", notify_var, notify_fd);
-            proc_env.set_var(var_str);
+            service_env.set_var(var_str);
         }
 
         // Set up Systemd-style socket activation:
@@ -170,20 +172,20 @@ void base_process_service::run_child_proc(run_proc_params params) noexcept
             if (dup2(socket_fd, 3) == -1) goto failure_out;
             if (socket_fd != 3) close(socket_fd);
 
-            proc_env.set_var("LISTEN_FDS=1");
+            service_env.set_var("LISTEN_FDS=1");
             snprintf(nbuf, bufsz, "LISTEN_PID=%jd", static_cast<intmax_t>(getpid()));
-            proc_env.set_var(nbuf);
+            service_env.set_var(nbuf);
         }
 
         if (csfd != -1) {
             err.stage = exec_stage::SETUP_CONTROL_SOCKET;
             snprintf(csenvbuf, csenvbufsz, "DINIT_CS_FD=%d", csfd);
-            proc_env.set_var(csenvbuf);
+            service_env.set_var(csenvbuf);
         }
 
         // We'll re-use READ_ENV_FILE stage here; it's accurate enough.
         err.stage = exec_stage::READ_ENV_FILE;
-        proc_env_map = proc_env.build(main_env);
+        proc_env_map = service_env.build(main_env);
     }
     catch (std::system_error &sys_err) {
         errno = sys_err.code().value();
@@ -202,19 +204,26 @@ void base_process_service::run_child_proc(run_proc_params params) noexcept
     }
 
     if (!on_console) {
-        // Re-set stdin, stdout, stderr
-        for (int i = 0; i < 3; i++) {
+        // Re-set stdin (possibly), stdout, stderr
+        int begin = (params.input_fd == -1) ? 0 : 1;
+        for (int i = begin; i < 3; i++) {
             if (i != force_notify_fd) close(i);
         }
 
         err.stage = exec_stage::SETUP_STDINOUTERR;
-        if (notify_fd == 0 || move_fd(open("/dev/null", O_RDONLY), 0) == 0) {
+        if (notify_fd == 0 || params.input_fd != -1 || move_fd(open("/dev/null", O_RDONLY), 0) == 0) {
             // stdin = 0. That's what we should have; proceed with opening stdout and stderr. We have to
             // take care not to clobber the notify_fd.
-        	if (output_fd == -1) {
-        		output_fd = open(logfile, O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR);
-        		if (output_fd == -1) goto failure_out;
-        	}
+            if (output_fd == -1) {
+                output_fd = open(logfile, O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR);
+                if (output_fd == -1) goto failure_out;
+                // Set permission of logfile if present
+                // if log type is NONE, we don't want to change ownership/permissions of /dev/null!
+                if (this->log_type == log_type_id::LOGFILE) {
+                    if (fchown(output_fd, logfile_uid, logfile_gid) == -1) goto failure_out;
+                    if (fchmod(output_fd, logfile_perms) == -1) goto failure_out;
+                }
+            }
             if (notify_fd != 1) {
                 if (move_fd(output_fd, 1) != 0) {
                     goto failure_out;
@@ -249,9 +258,6 @@ void base_process_service::run_child_proc(run_proc_params params) noexcept
         // will not see control signals from ^C etc.
 
         if (do_set_ctty) {
-            // Disable suspend (^Z) (and on some systems, delayed suspend / ^Y)
-            signal(SIGTSTP, SIG_IGN);
-
             // Become session leader
             setsid();
             ioctl(0, TIOCSCTTY, 0);
@@ -331,11 +337,59 @@ void base_process_service::run_child_proc(run_proc_params params) noexcept
     if (uid != uid_t(-1)) {
         err.stage = exec_stage::SET_UIDGID;
         // We must set group first (i.e. before we drop privileges)
-        if (setregid(gid, gid) != 0) goto failure_out;
+#if USE_INITGROUPS
+        // Initialize supplementary groups unless disabled; non-POSIX API
+        if (gid != gid_t(-1)) {
+            // Specific group; use that, with no supplementary groups.
+            // Note: for compatibility with FreeBSD, clear the groups list first before setting the
+            // effective gid, because on FreeBSD setgroups also sets the effective gid.
+            if (setgroups(0, nullptr)) goto failure_out;
+            if (setregid(gid, gid) != 0) goto failure_out;
+        }
+        else {
+            // No specific group; use groups associated with user.
+            errno = 0;
+            auto *pw = getpwuid(uid);
+            if (pw) {
+                if (setregid(pw->pw_gid, pw->pw_gid) != 0) goto failure_out;
+                if (initgroups(pw->pw_name, pw->pw_gid) != 0) goto failure_out;
+            }
+            else {
+                // null result with no errno indicates missing passwd entry; use ENOENT for want of a more
+                // specific error code.
+                if (errno == 0) errno = ENOENT;
+                goto failure_out;
+            }
+        }
+#else
+        // No support for supplementary groups; just set the specified group.
+        if (gid != gid_t(-1)) {
+            if (setregid(gid, gid) != 0) goto failure_out;
+        }
+#endif
         if (setreuid(uid, uid) != 0) goto failure_out;
     }
 
-    sigprocmask(SIG_SETMASK, &sigwait_set, nullptr);
+    // Restore signal mask. If running on the console, we'll keep various control signals that can
+    // be invoked from the terminal masked, with the exception of SIGHUP and possibly SIGINT.
+    {
+        sigset_t sigwait_set = orig_signal_mask;
+        sigdelset(&sigwait_set, SIGCHLD);
+        sigdelset(&sigwait_set, SIGTERM);
+        if (on_console && params.in_foreground) {
+            if (params.unmask_sigint) {
+                sigdelset(&sigwait_set, SIGINT);
+            }
+            else {
+                sigaddset(&sigwait_set, SIGINT);
+            }
+            sigaddset(&sigwait_set, SIGQUIT);
+            sigaddset(&sigwait_set, SIGTSTP);
+            sigaddset(&sigwait_set, SIGTTIN);
+            sigaddset(&sigwait_set, SIGTTOU);
+        }
+        sigprocmask(SIG_SETMASK, &sigwait_set, nullptr);
+    }
 
     err.stage = exec_stage::DO_EXEC;
     // (on linux we could use execvpe, but it's not POSIX and not in eg FreeBSD).

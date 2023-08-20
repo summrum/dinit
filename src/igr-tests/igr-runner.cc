@@ -12,9 +12,10 @@ extern char **environ;
 
 int main(int argc, char **argv)
 {
-    const char * const test_dirs[] = { "basic", "environ", "ps-environ", "chain-to", "force-stop",
-            "restart", "check-basic", "check-cycle", "check-lint", "reload1", "reload2", "no-command-error",
-            "add-rm-dep", "var-subst", "svc-start-fail", "dep-not-found" };
+    const char * const test_dirs[] = { "basic", "environ", "environ2", "ps-environ", "chain-to", "force-stop",
+            "restart", "check-basic", "check-cycle", "check-cycle2", "check-lint", "reload1", "reload2",
+            "no-command-error", "add-rm-dep", "var-subst", "svc-start-fail", "dep-not-found", "pseudo-cycle",
+            "before-after", "before-after2", "log-via-pipe", "catlog", "offline-enable" };
     constexpr int num_tests = sizeof(test_dirs) / sizeof(test_dirs[0]);
 
     int passed = 0;
@@ -81,7 +82,7 @@ int main(int argc, char **argv)
                 std::cout << "FAILED" << std::endl;
                 failed++;
             }
-            else if (WEXITSTATUS(wstatus) == 2) {
+            else if (WEXITSTATUS(wstatus) == 77) {
                 std::cout << "SKIPPED" << std::endl;
                 skipped++;
             }

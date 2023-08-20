@@ -29,14 +29,13 @@ using string_iterator = std::string::iterator;
 //   offsets - the [start,end) pair of offsets of the command and each argument within the string
 //
 static void do_env_subst(const char *setting_name, ha_string &line,
-        std::list<std::pair<unsigned,unsigned>> &offsets, bool do_sub_vars)
+        std::list<std::pair<unsigned,unsigned>> &offsets,
+        environment::env_map const &envmap)
 {
     using namespace dinit_load;
-    if (do_sub_vars) {
-        std::string line_s = std::string(line.c_str(), line.length());
-        cmdline_var_subst(setting_name, line_s, offsets, resolve_env_var);
-        line = line_s;
-    }
+    std::string line_s = std::string(line.c_str(), line.length());
+    value_var_subst(setting_name, line_s, offsets, resolve_env_var, envmap);
+    line = line_s;
 }
 
 // Process a dependency directory - filenames contained within correspond to service names which
@@ -99,13 +98,14 @@ service_record * dirload_service_set::reload_service(service_record * service)
 
 using service_dep_list = decltype(std::declval<dinit_load::service_settings_wrapper<prelim_dep>>().depends);
 
-// Check for dependency cycles for the specified service (orig) with the given set of dependencies
-static void check_cycle(service_dep_list &deps, service_record *orig)
+// Check for dependency cycles for the specified service (orig) with the given set of dependencies. Report
+// any cycles as occurring in _report_svc_name_.
+static void check_cycle(service_dep_list &deps, service_record *orig, const std::string &report_svc_name)
 {
     linked_uo_set<service_record *> pending;
     for (auto &new_dep : deps) {
         if (new_dep.to == orig) {
-            throw service_cyclic_dependency(orig->get_name());
+            throw service_cyclic_dependency(report_svc_name);
         }
         pending.add_back(new_dep.to);
     }
@@ -114,11 +114,17 @@ static void check_cycle(service_dep_list &deps, service_record *orig)
         auto &dep_list = (*i)->get_dependencies();
         for (auto &dep : dep_list) {
             if (dep.get_to() == orig) {
-                throw service_cyclic_dependency(orig->get_name());
+                throw service_cyclic_dependency(report_svc_name);
             }
             pending.add_back(dep.get_to());
         }
     }
+}
+
+// Check for dependency cycles in "before" dependencies, _orig_ is where cycles will be identified.
+static void check_cycle(service_dep_list &deps, service_record *orig)
+{
+    check_cycle(deps, orig, orig->get_name());
 }
 
 // Update the dependencies of the specified service atomically.
@@ -148,8 +154,10 @@ static void update_depenencies(service_record *service,
         }
 
         // Insert all the new dependencies before the first pre-existing dependency
-        for (auto &new_dep : settings.depends) {
+        for (auto i = settings.depends.begin(); i != settings.depends.end(); ) {
+            auto &new_dep = *i;
             service->add_dep(new_dep.to, new_dep.dep_type, first_preexisting);
+            i = settings.depends.erase(i);
         }
     }
     catch (...) {
@@ -169,12 +177,18 @@ static void update_depenencies(service_record *service,
         throw;
     }
 
-    // Now remove all pre-existing dependencies (no exceptions possible from here).
+    // Now remove all pre-existing dependencies, except for "before" dependencies (which come from the
+    // linked service and so must be retained)
     for( ; first_preexisting != deps.end(); ) {
-        first_preexisting = service->rm_dep(first_preexisting);
+        if (first_preexisting->dep_type != dependency_type::BEFORE) {
+            first_preexisting = service->rm_dep(first_preexisting);
+        }
+        else {
+            ++first_preexisting;
+        }
     }
 
-    // Also remove pre-existing "before" dependents
+    // Also remove pre-existing "before" dependents (because they come from this service)
     for( ; first_pre_dept != depts.end(); ) {
         auto next_pre_dept = std::next(first_pre_dept);
         if ((*first_pre_dept)->dep_type == dependency_type::BEFORE) {
@@ -210,40 +224,130 @@ static void update_command_and_dependencies(base_process_service *service,
     }
 }
 
+// Check that the provided settings are compatible / ok to be applied to the specified (already loaded)
+// service.
+// Returns: true if a new service record must be created, false otherwise
+static bool check_settings_for_reload(service_record *service,
+        dinit_load::service_settings_wrapper<prelim_dep> &settings)
+{
+    using namespace dinit_load;
+
+    const std::string &name = service->get_name();
+
+    // To begin, assume a new record is needed
+    bool create_new_record = true;
+
+    if (service->get_state() != service_state_t::STOPPED) {
+        // Can not change type of a running service.
+        if (settings.service_type != service->get_type()) {
+            throw service_load_exc(name, "cannot change type of non-stopped service.");
+        }
+        // Can not alter a starting/stopping service, at least for now.
+        if (service->get_state() != service_state_t::STARTED) {
+            throw service_load_exc(name,
+                    "cannot alter settings for service which is currently starting/stopping.");
+        }
+
+        // Check validity of dependencies (if started, regular deps must be started)
+        for (auto &new_dep : settings.depends) {
+            if (new_dep.dep_type == dependency_type::REGULAR) {
+                if (new_dep.to->get_state() != service_state_t::STARTED) {
+                    throw service_load_exc(name,
+                            std::string("cannot add non-started dependency '")
+                                + new_dep.to->get_name() + "'.");
+                }
+            }
+        }
+
+        // Cannot change certain flags
+        auto current_flags = service->get_flags();
+        if (current_flags.starts_on_console != settings.onstart_flags.starts_on_console
+                || current_flags.shares_console != settings.onstart_flags.shares_console) {
+            throw service_load_exc(name, "cannot change starts_on_console/"
+                    "shares_console flags for a running service.");
+        }
+
+        // Cannot change pid file
+        if (service->get_type() == service_type_t::BGPROCESS) {
+            auto *bgp_service = static_cast<bgproc_service *>(service);
+            if (bgp_service->get_pid_file() != settings.pid_file) {
+                throw service_load_exc(name, "cannot change pid_file for running service.");
+            }
+        }
+
+        // Cannot change inittab_id/inittab_line
+        #if USE_UTMPX
+            if (service->get_type() == service_type_t::PROCESS) {
+                auto *proc_service = static_cast<process_service *>(service);
+                auto *svc_utmp_id = proc_service->get_utmp_id();
+                auto *svc_utmp_ln = proc_service->get_utmp_line();
+                if (strncmp(svc_utmp_id, settings.inittab_id, proc_service->get_utmp_id_size()) != 0
+                        || strncmp(svc_utmp_ln, settings.inittab_line,
+                                proc_service->get_utmp_line_size()) != 0) {
+                    throw service_load_exc(name, "cannot change inittab-id or inittab-line "
+                            "settings for running service.");
+                }
+            }
+        #endif
+
+        // Cannot change log type
+        if (value(service->get_type()).is_in(service_type_t::PROCESS, service_type_t::BGPROCESS,
+                service_type_t::SCRIPTED)) {
+            base_process_service *bps = static_cast<base_process_service *>(service);
+            if (bps->get_log_mode() != settings.log_type) {
+                throw service_load_exc(name, "cannot change log-type for running service.");
+            }
+        }
+
+        // Already started; we must replace settings on existing service record
+        create_new_record = false;
+    }
+    else if (settings.service_type == service->get_type()) {
+        // No need to create a new record if the type hasn't changed
+        create_new_record = false;
+    }
+
+    return create_new_record;
+}
+
 service_record * dirload_service_set::load_reload_service(const char *name, service_record *reload_svc,
         const service_record *avoid_circular)
 {
+    // Load a new service, or reload an already-loaded service.
+
     // For reload, we have the following problems:
     // - ideally want to allow changing service type, at least for stopped services. That implies creating
     //   a new (replacement) service_record object, at least in cases where the type does change.
     // - dependencies may change (including addition of new dependencies which aren't yet loaded). We need
     //   to prevent cyclic dependencies forming.
     // - We want atomicity. If any new settings are not valid/alterable, or if a cyclic dependency is
-    //   created, nothing should change. Ideally this would extend to unloading any dependencies which were
-    //   loaded as part of the reload attempt.
+    //   created, nothing should change.
     // - We need to either transfer handles referring to the old service (so that they refer to the new
     //   service), or make them invalid. Or, we alter the original service without creating a new one
     //   (which we can only do if the type doesn't change).
 
     // Approach:
-    // - remember the initial service count, so we can remove services loaded as part of the reload
-    //   operation if we want to abort it later (i.e. if service count changed from N to N+X, remove the
-    //   last X services)
-    // - check that the new settings are valid (if the service is running, check if the settings can be
-    //   altered, though we may just defer some changes until service is restarted)
-    // - check all dependencies of the newly created service record for cyclic dependencies, via depth-first
-    //   traversal.
-    // - If changing type:
-    //   - create the service initially just as if loading a new service (but with no dummy placeholder,
-    //     use the original service for that).
-    //   - switch all dependents to depend on the new record. Copy necessary runtime data from the original
-    //     to the new service record. Remove dependencies from the old record, and release any dependency
-    //     services as appropriate (so they stop if no longer needed). Finally, remove the old service
-    //     record and delete it.
-    //  Otherwise:
-    //   - copy the new settings to the existing service
-    //   - fix dependencies
+    // - determine whether we need a new service record or can alter the existing one
+    //   (loading a new service always creates a new record; reload only creates a new record if the service
+    //   type changes, and otherwise just changes the existing record in-place).
+    // - if loading a new service, a dummy record is created to enable easy cyclic dependency detection.
+    //   (In other cases cycles must be checked by walking the service graph).
+    //   The dummy is replaced with the real service once loading is complete (or is removed if it fails).
+    // - process settings from the service file (into a service_settings_wrapper).
+    // - check that the new settings are valid (for reload, if the service is running, check if the settings
+    //   can be altered).
+    // - create the new record and install the new settings in it (or the existing record if not creating a
+    //   new record). If doing a reload, check for cycles at this point (there is no dummy record in this
+    //   case, so the quick cycle detection is not active).
+    // - (if doing a reload, with a new record) move the dependents on the original record to the new record.
     //
+    // "Before" dependencies require special handling, as a "before = " specified in a service actually creates
+    // a dependency in the specified service on this service. Hence they always require explicit cycle checks
+    // (the quick cycle detection method using a dummy service cannot be used). For reloads this is done early,
+    // for new services it is done late (after the dummy has been removed).
+    //
+    // This is all an intricate dance. If failure occurs at any stage, we must restore the previous state.
+
     // Limitations:
     // - caller must check there are no handles (or only a single requesting handle) to the service before
     //   calling
@@ -263,12 +367,17 @@ service_record * dirload_service_set::load_reload_service(const char *name, serv
 
     if (reload_svc == nullptr) {
         // First try and find an existing record...
-        service_record * rval = find_service(string(name));
-        if (rval != nullptr) {
-            if (rval == avoid_circular || rval->is_dummy()) {
+        service_record *existing = find_service(string(name), true);
+        if (existing != nullptr) {
+            if (existing == avoid_circular || existing->check_is_loading()) {
                 throw service_cyclic_dependency(name);
             }
-            return rval;
+            if (existing->get_type() != service_type_t::PLACEHOLDER) {
+                return existing;
+            }
+
+            // If we found a placeholder, we proceed as for a reload:
+            reload_svc = existing;
         }
     }
 
@@ -308,6 +417,7 @@ service_record * dirload_service_set::load_reload_service(const char *name, serv
     }
 
     service_settings_wrapper<prelim_dep> settings;
+    service_record *consumer_of_svc = nullptr;
 
     string line;
     // getline can set failbit if it reaches end-of-file, we don't want an exception in that case. There's
@@ -316,14 +426,64 @@ service_record * dirload_service_set::load_reload_service(const char *name, serv
 
     bool create_new_record = true;
 
-    try {
-        if (reload_svc == nullptr) {
-            // Add a dummy service record now to prevent infinite recursion in case of cyclic dependency.
-            // We replace this with the real service later (or remove it if we find a configuration error).
-            dummy = new service_record(this, string(name));
+    // any "before" "dependencies" that were loaded
+    std::list<service_dep> before_deps;
+
+    auto exception_cleanup = [&]() {
+        // Must remove the dummy service record.
+        if (dummy != nullptr) {
+            remove_service(dummy);
+            delete dummy;
+        }
+        if (create_new_record && rval != nullptr) {
+            rval->prepare_for_unload();
+            delete rval;
+        }
+        for (service_dep &before_dep : before_deps) {
+            service_record *before_svc = before_dep.get_from();
+            if (before_svc->get_type() == service_type_t::PLACEHOLDER) {
+                if (before_svc->is_unrefd()) {
+                    remove_service(before_svc);
+                    delete before_svc;
+                }
+            }
+        }
+        // Remove any "after" placeholders that were created while loading but not successfully added as
+        // dependencies on the new service (rval). (This requires that settings.depends has been cleared
+        // of any dependencies that were successfully added).
+        for (prelim_dep &dep : settings.depends) {
+            if (dep.to->get_type() == service_type_t::PLACEHOLDER) {
+                if (dep.dep_type == dependency_type::AFTER && dep.to->is_unrefd()) {
+                    remove_service(dep.to);
+                }
+            }
+        }
+        // Remove any placeholder consumed service.
+        if (consumer_of_svc != nullptr) {
+           if (consumer_of_svc->get_type() == service_type_t::PLACEHOLDER) {
+               if (consumer_of_svc->is_unrefd()) {
+                   remove_service(consumer_of_svc);
+                   delete consumer_of_svc;
+               }
+           }
+        }
+    };
+
+    if (reload_svc == nullptr) {
+        // Add a placeholder record now to prevent infinite recursion in case of cyclic dependency.
+        // We replace this with the real service later (or remove it if we find a configuration error).
+        try {
+            dummy = new service_record(this, string(name), service_record::LOADING_TAG);
             add_service(dummy);
         }
+        catch (...) {
+            delete dummy; // (no effect if dummy is null)
+            dummy = nullptr;
+            throw;
+        }
+    }
 
+    try {
         process_service_file(name, service_file,
                 [&](string &line, unsigned line_num, string &setting,
                         string_iterator &i, string_iterator &end) -> void {
@@ -358,119 +518,187 @@ service_record * dirload_service_set::load_reload_service(const char *name, serv
             throw service_load_exc(name, msg);
         };
 
-        settings.finalise(report_err);
+        environment srv_env;
+
+        // Fill user vars before reading env file
+        if (settings.export_passwd_vars) {
+            fill_environment_userinfo(settings.run_as_uid, name, srv_env);
+        }
+
+        // Set service name in environment if desired
+        if (settings.export_service_name) {
+            std::string envname = "DINIT_SERVICE=";
+            envname += name;
+            srv_env.set_var(std::move(envname));
+        }
+
+        // This mapping is temporary, for load substitutions. (The environment actually *may* change
+        // after load, e.g. through dinitctl setenv, either from the outside or from within services,
+        // and so we need to calculate a fresh mapping on each process invocation).
+        environment::env_map srv_envmap;
+
+        if (!settings.env_file.empty()) {
+            try {
+                read_env_file(settings.env_file.data(), false, srv_env);
+            } catch (const std::system_error &se) {
+                throw service_load_exc(name, std::string("could not load environment file: ") + se.what());
+            }
+        }
+
+        srv_envmap = srv_env.build(main_env);
+
+        settings.finalise(report_err, srv_envmap);
         auto service_type = settings.service_type;
 
         if (reload_svc != nullptr) {
             // Make sure settings are able to be changed/are compatible
-            service_record *service = reload_svc;
-            if (service->get_state() != service_state_t::STOPPED) {
-                // Can not change type of a running service.
-                if (service_type != service->get_type()) {
-                    throw service_load_exc(name, "cannot change type of non-stopped service.");
+            create_new_record = check_settings_for_reload(reload_svc, settings);
+            // If service current has an output consumer, make sure new settings are compatible
+            if (reload_svc->get_log_consumer() != nullptr) {
+                if (!value(service_type).is_in(service_type_t::PROCESS, service_type_t::BGPROCESS,
+                        service_type_t::SCRIPTED)) {
+                    throw service_load_exc(name, "service has output consumer; service type must correspond "
+                            "to output-producing service (process, bgprocess, or scripted)");
                 }
-                // Can not alter a starting/stopping service, at least for now.
-                if (service->get_state() != service_state_t::STARTED) {
-                    throw service_load_exc(name,
-                            "cannot alter settings for service which is currently starting/stopping.");
+                if (settings.log_type != log_type_id::PIPE) {
+                    throw service_load_exc(name, "service has output consumer; log type must be set "
+                            "to 'pipe'");
                 }
-
-                // Check validity of dependencies (if started, regular deps must be started)
-                for (auto &new_dep : settings.depends) {
-                    if (new_dep.dep_type == dependency_type::REGULAR) {
-                        if (new_dep.to->get_state() != service_state_t::STARTED) {
-                            throw service_load_exc(name,
-                                    std::string("cannot add non-started dependency '")
-                                        + new_dep.to->get_name() + "'.");
-                        }
-                    }
-                }
-
-                // Cannot change certain flags
-                auto current_flags = service->get_flags();
-                if (current_flags.starts_on_console != settings.onstart_flags.starts_on_console
-                        || current_flags.shares_console != settings.onstart_flags.shares_console) {
-                    throw service_load_exc(name, "cannot change starts_on_console/"
-                            "shares_console flags for a running service.");
-                }
-
-                // Cannot change pid file
-                if (service->get_type() == service_type_t::BGPROCESS) {
-                    auto *bgp_service = static_cast<bgproc_service *>(service);
-                    if (bgp_service->get_pid_file() != settings.pid_file) {
-                        throw service_load_exc(name, "cannot change pid_file for running service.");
-                    }
-                }
-
-                // Cannot change inittab_id/inittab_line
-                #if USE_UTMPX
-                    if (service->get_type() == service_type_t::PROCESS) {
-                        auto *proc_service = static_cast<process_service *>(service);
-                        auto *svc_utmp_id = proc_service->get_utmp_id();
-                        auto *svc_utmp_ln = proc_service->get_utmp_line();
-                        if (strncmp(svc_utmp_id, settings.inittab_id, proc_service->get_utmp_id_size()) != 0
-                                || strncmp(svc_utmp_ln, settings.inittab_line,
-                                        proc_service->get_utmp_line_size()) != 0) {
-                            throw service_load_exc(name, "cannot change inittab-id or inittab-line "
-                                    "settings for running service.");
-                        }
-                    }
-                #endif
-
-                // Already started; we must replace settings on existing service record
-                create_new_record = false;
             }
-            else if (service_type != service->get_type()) {
-                // No need to create a new record if the type hasn't changed
-                create_new_record = false;
+            // We also don't allow a running service to change its consumed service. This is checked
+            // shortly.
+        }
+
+        bool have_consumed_svc = !settings.consumer_of_name.empty();
+        if (have_consumed_svc) {
+            consumer_of_svc = find_service(settings.consumer_of_name.c_str(), true);
+        }
+
+        if (reload_svc != nullptr && reload_svc->get_state() != service_state_t::STOPPED) {
+            if (value(service_type).is_in(service_type_t::PROCESS, service_type_t::BGPROCESS)) {
+                // Since it is not stopped, reload_svc type must be same as service_type, or
+                // check_settings_for_reload would have complained. So it's also either PROCESS or
+                // BGPROCESS.
+                auto *current_consumed = ((process_service *)reload_svc)->get_consumed();
+                if (current_consumed != consumer_of_svc) {
+                    throw service_load_exc(name, "cannot change consumed service ('consumer-of') when not stopped");
+                }
             }
         }
 
         // Note, we need to be very careful to handle exceptions properly and roll back any changes that
-        // we've made before the exception occurred.
+        // we've made before the exception occurred, including destroying any placeholder services that we
+        // create, etc.
 
-        // if we have "before" constraints, check them now, before we potentially do irreversible changes
-        // to an existing service.
-        std::list<service_dep> before_deps;
-        if (dummy == nullptr) {
-            for (const std::string &before_ent : settings.before_svcs) {
-                service_record *before_svc;
+        if (have_consumed_svc) {
+            if (consumer_of_svc == nullptr) {
+                consumer_of_svc = new placeholder_service(this, settings.consumer_of_name);
                 try {
-                    before_svc = load_service(before_ent.c_str());
+                    add_service(consumer_of_svc);
                 }
-                catch (service_description_exc &sle) {
-                    log_service_load_failure(sle);
-                    throw service_load_exc(name, "could not load dependency.");
+                catch (...) {
+                    delete consumer_of_svc;
+                    consumer_of_svc = nullptr;
+                    throw;
                 }
-                catch (service_load_exc &sle) {
-                    log(loglevel_t::ERROR, "Could not load service ", sle.service_name, ": ",
-                            sle.exc_description);
-                    throw service_load_exc(name, "could not load dependency.");
+            }
+            else {
+                auto consumed_type = consumer_of_svc->get_type();
+                if (!value(consumed_type).is_in(service_type_t::PROCESS, service_type_t::BGPROCESS,
+                        service_type_t::SCRIPTED, service_type_t::PLACEHOLDER)) {
+                    throw service_load_exc(name, "the 'consumer-of' setting specifies a service of a "
+                            "type that does not produce output");
                 }
-                before_deps.emplace_back(before_svc, reload_svc, dependency_type::BEFORE);
-                // (note, we may need to adjust the to-service if we create a new service record object)
-                check_cycle(settings.depends, before_svc);
-                if (before_svc == reload_svc) {
-                    throw service_cyclic_dependency(before_svc->get_name());
+                if (consumed_type != service_type_t::PLACEHOLDER) {
+                    base_process_service *bps_consumed = static_cast<base_process_service *>(consumer_of_svc);
+                    if (bps_consumed->get_log_mode() != log_type_id::PIPE) {
+                        throw service_load_exc(name, "the 'consumer-of' setting specifies a service that "
+                                "does not log via a pipe ('log-type = pipe')");
+                    }
+                }
+                service_record *current_consumer = consumer_of_svc->get_log_consumer();
+                if (current_consumer != nullptr && current_consumer != reload_svc) {
+                    throw service_load_exc(name, "the 'consumer-of' setting specifies a service that "
+                            "already has a consumer");
                 }
             }
         }
-        else {
-            // If we have a dummy service in place, we can't load "before" services since they
-            // may depend on *this* service which is currently represented as a dummy, which would
-            // trigger cycle detection.
-            // So, we'll do it later in this case. We can also postpone if we'll be creating a
-            // replacement service record rather than modifying the original.
+
+        // If we have "after" constraints, load them now and treat them as regular dependencies. We need
+        // to do this now, after the other dependents are loaded, because we might create a placeholder
+        // instead (and we don't want to create a placeholder, have it added to the list of dependencies,
+        // then load the same service as a real dependency shortly afterwards, which would replace the
+        // placeholder but leave a dangling pointer to it in the list).
+        for (const std::string &after_ent : settings.after_svcs) {
+            service_record *after_svc;
+            if (after_ent == name) throw service_cyclic_dependency(name);
+
+            after_svc = find_service(after_ent.c_str(), true);
+            if (after_svc != nullptr) {
+                if (after_svc->check_is_loading()) {
+                    throw service_cyclic_dependency(name);
+                }
+            }
+            if (after_svc == nullptr) {
+                after_svc = new placeholder_service(this, after_ent);
+                try {
+                    add_service(after_svc);
+                }
+                catch (...) {
+                    delete after_svc;
+                    throw;
+                }
+            }
+
+            try {
+                settings.depends.emplace_back(after_svc, dependency_type::AFTER);
+            }
+            catch (...) {
+                if (after_svc->is_unrefd()) {
+                    remove_service(after_svc);
+                    delete after_svc;
+                    throw;
+                }
+            }
+        }
+
+        // if we have "before" constraints, check them now.
+        for (const std::string &before_ent : settings.before_svcs) {
+            service_record *before_svc;
+            if (before_ent == name) throw service_cyclic_dependency(name);
+
+            before_svc = find_service(before_ent.c_str(), true);
+            if (before_svc != nullptr) {
+                check_cycle(settings.depends, before_svc, name);
+            }
+            else {
+                bool before_svc_added = false;
+                try {
+                    before_svc = new placeholder_service(this, before_ent);
+                    add_service(before_svc);
+                    before_svc_added = true;
+                }
+                catch (...) {
+                    if (before_svc_added) remove_service(before_svc);
+                    delete before_svc;
+                    throw;
+                }
+            }
+
+            before_deps.emplace_back(before_svc, reload_svc, dependency_type::BEFORE);
+            // (note, we may need to adjust the to-service if we create a new service record object
+            // - this will be done later)
         }
 
         if (service_type == service_type_t::PROCESS) {
-            do_env_subst("command", settings.command, settings.command_offsets, settings.do_sub_vars);
-            do_env_subst("stop-command", settings.stop_command, settings.stop_command_offsets, settings.do_sub_vars);
+            do_env_subst("command", settings.command, settings.command_offsets, srv_envmap);
+            do_env_subst("stop-command", settings.stop_command, settings.stop_command_offsets, srv_envmap);
             std::vector<const char *> stop_arg_parts = separate_args(settings.stop_command, settings.stop_command_offsets);
             process_service *rvalps;
             if (create_new_record) {
                 rvalps = new process_service(this, string(name), std::move(settings.command),
                         settings.command_offsets, settings.depends);
+                settings.depends.clear();
                 if (reload_svc != nullptr) {
                     check_cycle(settings.depends, reload_svc);
                 }
@@ -496,7 +724,8 @@ service_record * dirload_service_set::load_reload_service(const char *name, serv
             rvalps->set_run_as_uid_gid(settings.run_as_uid, settings.run_as_gid);
             rvalps->set_notification_fd(settings.readiness_fd);
             rvalps->set_notification_var(std::move(settings.readiness_var));
-            rvalps->set_log_file(std::move(settings.logfile));
+            rvalps->set_logfile_details(std::move(settings.logfile), settings.logfile_perms,
+                    settings.logfile_uid, settings.logfile_gid);
             rvalps->set_log_buf_max(settings.max_log_buffer_sz);
             rvalps->set_log_mode(settings.log_type);
             #if USE_UTMPX
@@ -505,13 +734,14 @@ service_record * dirload_service_set::load_reload_service(const char *name, serv
             #endif
         }
         else if (service_type == service_type_t::BGPROCESS) {
-            do_env_subst("command", settings.command, settings.command_offsets, settings.do_sub_vars);
-            do_env_subst("stop-command", settings.stop_command, settings.stop_command_offsets, settings.do_sub_vars);
+            do_env_subst("command", settings.command, settings.command_offsets, srv_envmap);
+            do_env_subst("stop-command", settings.stop_command, settings.stop_command_offsets, srv_envmap);
             std::vector<const char *> stop_arg_parts = separate_args(settings.stop_command, settings.stop_command_offsets);
             bgproc_service *rvalps;
             if (create_new_record) {
                 rvalps = new bgproc_service(this, string(name), std::move(settings.command),
                         settings.command_offsets, settings.depends);
+                settings.depends.clear();
                 if (reload_svc != nullptr) {
                     check_cycle(settings.depends, reload_svc);
                 }
@@ -536,19 +766,21 @@ service_record * dirload_service_set::load_reload_service(const char *name, serv
             rvalps->set_start_timeout(settings.start_timeout);
             rvalps->set_extra_termination_signal(settings.term_signal);
             rvalps->set_run_as_uid_gid(settings.run_as_uid, settings.run_as_gid);
-            rvalps->set_log_file(std::move(settings.logfile));
+            rvalps->set_logfile_details(std::move(settings.logfile), settings.logfile_perms,
+                    settings.logfile_uid, settings.logfile_gid);
             rvalps->set_log_buf_max(settings.max_log_buffer_sz);
             rvalps->set_log_mode(settings.log_type);
             settings.onstart_flags.runs_on_console = false;
         }
         else if (service_type == service_type_t::SCRIPTED) {
-            do_env_subst("command", settings.command, settings.command_offsets, settings.do_sub_vars);
-            do_env_subst("stop-command", settings.stop_command, settings.stop_command_offsets, settings.do_sub_vars);
+            do_env_subst("command", settings.command, settings.command_offsets, srv_envmap);
+            do_env_subst("stop-command", settings.stop_command, settings.stop_command_offsets, srv_envmap);
             std::vector<const char *> stop_arg_parts = separate_args(settings.stop_command, settings.stop_command_offsets);
             scripted_service *rvalps;
             if (create_new_record) {
                 rvalps = new scripted_service(this, string(name), std::move(settings.command),
                         settings.command_offsets, settings.depends);
+                settings.depends.clear();
                 if (reload_svc != nullptr) {
                     check_cycle(settings.depends, reload_svc);
                 }
@@ -570,7 +802,8 @@ service_record * dirload_service_set::load_reload_service(const char *name, serv
             rvalps->set_start_timeout(settings.start_timeout);
             rvalps->set_extra_termination_signal(settings.term_signal);
             rvalps->set_run_as_uid_gid(settings.run_as_uid, settings.run_as_gid);
-            rvalps->set_log_file(std::move(settings.logfile));
+            rvalps->set_logfile_details(std::move(settings.logfile), settings.logfile_perms,
+                    settings.logfile_uid, settings.logfile_gid);
             rvalps->set_log_buf_max(settings.max_log_buffer_sz);
             rvalps->set_log_mode(settings.log_type);
         }
@@ -583,6 +816,7 @@ service_record * dirload_service_set::load_reload_service(const char *name, serv
                     /* TRIGGERED */
                     rval = new triggered_service(this, string(name), service_type, settings.depends);
                 }
+                settings.depends.clear();
                 if (reload_svc != nullptr) {
                     check_cycle(settings.depends, reload_svc);
                 }
@@ -599,41 +833,59 @@ service_record * dirload_service_set::load_reload_service(const char *name, serv
         rval->set_socket_details(std::move(settings.socket_path), settings.socket_perms,
                 settings.socket_uid, settings.socket_gid);
         rval->set_chain_to(std::move(settings.chain_to_name));
+        rval->set_environment(std::move(srv_env));
 
-        if (create_new_record && reload_svc != nullptr) {
+        if (create_new_record) {
             // switch dependencies on old record so that they refer to the new record
 
+            // first link in all the (new) "before" dependents (one way at this stage):
             auto &dept_list = rval->get_dependents();
-            for (auto &dept : before_deps) {
-                dept_list.push_back(&dept);
-            }
-
-            // Add dependent-link for all dependencies. Add to the new service first, so we can rollback
-            // on failure:
-            int added_dep_links = 0;
+            unsigned added_dependents = 0;
             try {
-                for (auto &dep : rval->get_dependencies()) {
-                    dep.get_to()->get_dependents().push_back(&dep);
-                    added_dep_links++;
+                for (auto &dept : before_deps) {
+                    dept_list.push_back(&dept);
+                    ++added_dependents;
                 }
             }
             catch (...) {
-                // exception caught; roll back any added dependencies and re-throw
-                for (auto &dep : rval->get_dependencies()) {
-                    if (added_dep_links-- == 0) break;
-                    dep.get_to()->get_dependents().pop_back();
+                // Undo, since the invalid state will cause issues when the new service is disposed of
+                while (added_dependents > 0) {
+                    dept_list.pop_back();
+                    --added_dependents;
                 }
                 throw;
             }
 
             // --- Point of no return: mustn't fail from here ---
 
-            // Remove all "before" dependents from the original service
-            auto &reload_depts = reload_svc->get_dependents();
+            // Splice in the new "before" dependencies
+            auto i = before_deps.begin();
+            decltype(i) j;
+            while (i != before_deps.end()) {
+                j = std::next(i);
+                i->set_to(rval);
+                auto &from_deps = i->get_from()->get_dependencies();
+                from_deps.splice(from_deps.end(), before_deps, i);
+                i = j;
+            }
+
+            // Which service are we replacing? (It's either the one that's being reloaded, or a dummy)
+            service_record *orig_svc = (reload_svc != nullptr) ? reload_svc : dummy;
+
+            // Complete dependency/dependent transfers.
+
+            // Remove all "before" dependents from the original service (these were created by the
+            // original service itself)
+            auto &reload_depts = orig_svc->get_dependents();
             for (auto i = reload_depts.begin(); i != reload_depts.end(); ) {
                 auto next_i = std::next(i);
                 if ((*i)->dep_type == dependency_type::BEFORE) {
-                    (*i)->get_from()->rm_dep(**i);
+                    service_record *before_svc = (*i)->get_from();
+                    before_svc->rm_dep(**i);
+                    if (before_svc->get_type() == service_type_t::PLACEHOLDER && before_svc->is_unrefd()) {
+                        remove_service(before_svc);
+                        delete before_svc;
+                    }
                 }
                 i = next_i;
             }
@@ -646,48 +898,51 @@ service_record * dirload_service_set::load_reload_service(const char *name, serv
                 dept->set_to(rval);
             }
 
-            // Remove dependent-link for all dependencies from the original:
-            reload_svc->prepare_for_unload();
-
-            // Splice in the "before" dependencies
-            auto i = before_deps.begin();
-            decltype(i) j;
-            while (i != before_deps.end()) {
-                j = std::next(i);
-                i->set_to(rval);
-                auto &from_deps = i->get_from()->get_dependencies();
-                from_deps.splice(from_deps.end(), before_deps, i);
-                i = j;
+            // Transfer all "before" dependencies (which are actually created by other services) to the
+            // new service
+            auto &dep_list_prev = orig_svc->get_dependencies();
+            auto &dep_list = rval->get_dependencies();
+            for (auto i = dep_list_prev.begin(); i != dep_list_prev.end(); ++i) {
+                if (i->dep_type == dependency_type::BEFORE) {
+                    i->set_from(rval);
+                    dep_list.splice(dep_list.end(), dep_list_prev, i++);
+                    continue;
+                }
             }
+
+            // Transfer any open file descriptors for (log) output to new service record
+            if (value(service_type).is_in(service_type_t::PROCESS, service_type_t::BGPROCESS, service_type_t::SCRIPTED)) {
+                ((base_process_service *)rval)->set_output_pipe_fds(orig_svc->transfer_output_pipe());
+                auto *orig_consumer = orig_svc->get_log_consumer();
+                if (orig_consumer != nullptr) {
+                    orig_consumer->set_consumer_for(rval);
+                }
+            }
+
+            // Remove dependent-link for all dependencies from the original:
+            orig_svc->prepare_for_unload();
+
+            // Remove consumer-for link from consumed service, if it's changing:
+            if (value(orig_svc->get_type()).is_in(service_type_t::PROCESS, service_type_t::BGPROCESS)) {
+                process_service *ps_orig = static_cast<process_service *>(orig_svc);
+                auto *orig_consumed = ps_orig->get_consumed();
+                if (orig_consumed != nullptr && orig_consumed != consumer_of_svc) {
+                    orig_consumed->set_log_consumer(nullptr);
+                }
+            }
+
+            // Finally, replace the old service with the new one:
+            auto iter = std::find(records.begin(), records.end(), orig_svc);
+            *iter = rval;
+            delete orig_svc;
         }
 
-        if (dummy != nullptr) {
-            auto iter = std::find(records.begin(), records.end(), dummy);
-            *iter = rval;
-            delete dummy;
-
-            // process before entries now. We must do it after "installing" the newly loaded service
-            // in the service set (which we do just above) in order to avoid triggering the cycle
-            // detection (in case the "before" service depends directly on this one) due to the dummy
-            // service.
-            auto ii = std::prev(rval->get_dependents().end());
-            auto i = settings.before_svcs.begin();
-            try {
-                for ( ; i != settings.before_svcs.end(); ++i) {
-                    const std::string &before_ent = *i;
-                    service_record *before_svc = load_service(before_ent.c_str());
-                    before_svc->add_dep(rval, dependency_type::BEFORE);
-                }
-            }
-            catch (...) {
-                // undo if unsuccessful:
-                for (auto j = std::next(ii); j != rval->get_dependents().end(); j = std::next(ii)) {
-                    (*j)->get_to()->rm_dep(**j);
-                }
-                dummy = nullptr;
-                rval->prepare_for_unload();
-                records.erase(std::find(records.begin(), records.end(), rval));
-                throw;
+        // Mark as consumer for output of target service (if any)
+        if (value(service_type).is_in(service_type_t::PROCESS, service_type_t::BGPROCESS)) {
+            process_service *psvc = (process_service *)rval;
+            psvc->set_consumer_for(consumer_of_svc);
+            if (consumer_of_svc != nullptr) {
+                consumer_of_svc->set_log_consumer(psvc);
             }
         }
 
@@ -695,12 +950,7 @@ service_record * dirload_service_set::load_reload_service(const char *name, serv
     }
     catch (service_description_exc &setting_exc)
     {
-        // Must remove the dummy service record.
-        if (dummy != nullptr) {
-            records.erase(std::find(records.begin(), records.end(), dummy));
-            delete dummy;
-        }
-        if (create_new_record) delete rval;
+        exception_cleanup();
         if (setting_exc.service_name.empty()) {
             setting_exc.service_name = name;
         }
@@ -708,20 +958,13 @@ service_record * dirload_service_set::load_reload_service(const char *name, serv
     }
     catch (std::system_error &sys_err)
     {
-        if (dummy != nullptr) {
-            records.erase(std::find(records.begin(), records.end(), dummy));
-            delete dummy;
-        }
-        if (create_new_record) delete rval;
-        throw service_load_exc(name, sys_err.what());
+        exception_cleanup();
+        // don't use sys_err.what() since libstdc++ sometimes includes class names (basic_filebuf):
+        throw service_load_exc(name, sys_err.code().message());
     }
     catch (...) // (should only be std::bad_alloc or service_load_exc)
     {
-        if (dummy != nullptr) {
-            records.erase(std::find(records.begin(), records.end(), dummy));
-            delete dummy;
-        }
-        if (create_new_record) delete rval;
+        exception_cleanup();
         throw;
     }
 }

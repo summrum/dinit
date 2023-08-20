@@ -5,46 +5,28 @@ on:
     branches:
       - master
     paths:
-      - '**'
-      - '!.*'
-      - '!README.md'
-      - '!NEWS'
-      - '!BUILD*'
-      - '!CONTRIBUTORS'
-      - '!TODO'
-      - '!LICENSE'
+      - '.github/workflows/regular_ci.yml'
+      - 'build/**'
+      - 'configs/**'
+      - 'dasynq/**'
+      - 'src/**'
+      - '**/Makefile'
+      - '!build/mconfig.mesontemplate'
       - '!build/includes/README'
-      - '!doc/CODE-STYLE'
-      - '!doc/COMPARISON'
-      - '!doc/CONTRIBUTING'
-      - '!doc/DESIGN'
-      - '!doc/getting_started.md'
-      - '!doc/manpages/README'
-      - '!doc/manpages/generate-html.sh'
-      - '!doc/manpages/DINIT-AS-INIT.md'
-      - '!doc/linux/**'
+      - '!**/meson.build'
   pull_request:
     branches:
       - master
     paths:
-      - '**'
-      - '!.*'
-      - '!README.md'
-      - '!NEWS'
-      - '!BUILD*'
-      - '!CONTRIBUTORS'
-      - '!TODO'
-      - '!LICENSE'
+      - '.github/workflows/regular_ci.yml'
+      - 'build/**'
+      - 'configs/**'
+      - 'dasynq/**'
+      - 'src/**'
+      - '**/Makefile'
+      - '!build/mconfig.mesontemplate'
       - '!build/includes/README'
-      - '!doc/CODE-STYLE'
-      - '!doc/COMPARISON'
-      - '!doc/CONTRIBUTING'
-      - '!doc/DESIGN'
-      - '!doc/getting_started.md'
-      - '!doc/manpages/README'
-      - '!doc/manpages/generate-html.sh'
-      - '!doc/manpages/DINIT-AS-INIT.md'
-      - '!doc/linux/**'
+      - '!**/meson.build'
   workflow_dispatch:
 
 jobs:
@@ -55,6 +37,7 @@ jobs:
     container:
       image: debian:bullseye
     strategy:
+      fail-fast: false # Upload src/igr-tests/*/output/* files in igr-tests
       matrix:
         include:
           - arch: 'amd64'
@@ -69,12 +52,12 @@ jobs:
       if: ${{ matrix.arch == 'amd64' }}
       run: |
         apt-get update
-        apt-get install g++ make m4 file -y
+        DEBIAN_FRONTEND=noninteractive apt-get install g++ make m4 file -y
     - name: Getting depends (i386)
       if: ${{ matrix.arch == 'i386' }}
       run: |
         apt-get update
-        apt-get install gcc:i386 make:i386 m4:i386 g++:i386 file -y
+        DEBIAN_FRONTEND=noninteractive apt-get install gcc:i386 make:i386 m4:i386 g++:i386 file -y
     - name: Print g++ architecture
       run: g++ -dumpmachine
     - name: Build
@@ -84,12 +67,19 @@ jobs:
     - name: Unit tests
       run: make check
     - name: Integration tests
-      run: make check-igr
+      run: make check-igr DEBUG=1
+    - name: Upload igr-tests output file(s) on failure
+      uses: actions/upload-artifact@v3.1.2
+      if: failure()
+      with:
+          name: igr-tests_output
+          path: src/igr-tests/*/output/*
 
   MacOS-latest_build:
 
     runs-on: macos-latest
     strategy:
+      fail-fast: false # Upload src/igr-tests/*/output/* files in igr-tests
       matrix:
         include:
           - arch: 'amd64'
@@ -109,12 +99,19 @@ jobs:
     - name: Unit tests
       run: make check
     - name: Integration tests
-      run: make check-igr
+      run: make check-igr DEBUG=1
+    - name: Upload igr-tests output file(s) on failure
+      uses: actions/upload-artifact@v3.1.2
+      if: failure()
+      with:
+          name: igr-tests_output
+          path: src/igr-tests/*/output/*
 
   Alpine-latest_build:
 
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false # Upload src/igr-tests/*/output/* files in igr-tests
       matrix:
         include:
           - arch: 'armv6'
@@ -123,7 +120,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-    - uses: uraimo/run-on-arch-action@v2.5.0
+    - uses: uraimo/run-on-arch-action@v2.5.1
       name: Getting depends & build & unit tests & integration tests
       with:
         arch: ${{ matrix.arch }}
@@ -142,5 +139,11 @@ jobs:
           file ./src/dinit
           echo "$(tput bold) ----Unit tests---- :$(tput sgr0) make check"
           make check
-          echo "$(tput bold) ----Integration tests---- :$(tput sgr0) make check-igr"
-          make check-igr
+          echo "$(tput bold) ----Integration tests---- :$(tput sgr0) make check-igr DEBUG=1"
+          make check-igr DEBUG=1
+    - name: Upload igr-tests output file(s) on failure
+      uses: actions/upload-artifact@v3.1.2
+      if: failure()
+      with:
+          name: igr-tests_output
+          path: src/igr-tests/*/output/*

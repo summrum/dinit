@@ -17,6 +17,34 @@
 
 #include "baseproc-sys.h"
 
+// Check if a value is one of several possible values.
+// Use like:     value(x).is_in(1,2,3)
+template <typename T>
+class value_cls {
+    const T &v;
+public:
+    value_cls(const T &v) : v(v) {}
+
+    template <typename U>
+    bool is_in(U&& val)
+    {
+        return v == val;
+    }
+
+    template <typename U, typename ...V>
+    bool is_in(U&&val, V&&... vals) {
+        if (v == val)
+            return true;
+        return is_in(vals...);
+    }
+};
+
+template <typename T>
+value_cls<T> value(const T &v)
+{
+    return value_cls<T>(v);
+}
+
 // Complete read - read the specified size until end-of-file or error; continue read if
 // interrupted by signal.
 inline ssize_t complete_read(int fd, void * buf, size_t n)
@@ -94,7 +122,8 @@ inline bool starts_with(const std::string &s, const char *prefix)
     return *prefix == 0;
 }
 
-// An allocator that doesn't value-initialise for construction
+// An allocator that doesn't value-initialise for construction. Eg for containers of primitive types this
+// allocator avoids the overhead of initialising new elements to 0.
 template <typename T>
 class default_init_allocator : public std::allocator<T>
 {
@@ -106,18 +135,17 @@ public:
         using other = default_init_allocator<U>;
     };
 
-    // Note this is only a template so that if there is no suitable constructor for T, we won't
-    // error out here
-    template <typename U>
-    void construct(U *obj)
+    template <typename U = std::enable_if<std::is_default_constructible<T>::value>>
+    void construct(T *obj)
     {
-        ::new(obj) U;
+        // avoid value-initialisation:
+        ::new(obj) T;
     }
 
     template <typename ...Args>
-    void construct(T *obj, Args... args)
+    void construct(T *obj, Args&&... args)
     {
-        std::allocator<T>::construct(obj, args...);
+        std::allocator<T>::construct(obj, std::forward<Args>(args)...);
     }
 };
 
@@ -197,9 +225,9 @@ class dinit_equal_to
 {
 public:
     template <typename A, typename B>
-    bool operator()(const A &a, const B &b)
+    bool operator()(A &&a, B &&b)
     {
-        return a == b;
+        return std::forward<A>(a) == std::forward<B>(b);
     }
 };
 
@@ -353,7 +381,7 @@ private:
             // First, check if the value is already present
             bucket_num = hashval % buckets.size();
             auto list_it = std::find_if(buckets[bucket_num].begin(), buckets[bucket_num].end(),
-                    [&](key_type &k) { return key_equal_f(k,value); });
+                    [&](const key_type &k) { return key_equal_f(k,std::forward<V>(value)); });
             if (list_it != buckets[bucket_num].end()) {
                 return { { &buckets, list_it, bucket_num }, false };
             }

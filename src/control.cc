@@ -12,12 +12,9 @@
 
 // Control protocol versions:
 // 1 - dinit 0.16 and prior
-// 2 - dinit 0.17 (adds DINIT_CP_SETTRIGGER, DINIT_CP_CATLOG)
+// 2 - dinit 0.17 (adds DINIT_CP_SETTRIGGER, DINIT_CP_CATLOG, DINIT_CP_SIGNAL)
 
 namespace {
-    constexpr auto OUT_EVENTS = dasynq::OUT_EVENTS;
-    constexpr auto IN_EVENTS = dasynq::IN_EVENTS;
-
     // Control protocol minimum compatible version and current version:
     constexpr uint16_t min_compat_version = 1;
     constexpr uint16_t cp_version = 2;
@@ -46,7 +43,7 @@ bool control_conn_t::process_packet()
         char replyBuf[] = { DINIT_RP_CPVERSION, 0, 0, 0, 0 };
         memcpy(replyBuf + 1, &min_compat_version, 2);
         memcpy(replyBuf + 3, &cp_version, 2);
-        if (! queue_packet(replyBuf, sizeof(replyBuf))) return false;
+        if (!queue_packet(replyBuf, sizeof(replyBuf))) return false;
         rbuf.consume(1);
         return true;
     }
@@ -74,7 +71,7 @@ bool control_conn_t::process_packet()
         }
         
         if (contains({shutdown_type_t::REMAIN, shutdown_type_t::HALT,
-            	shutdown_type_t::POWEROFF, shutdown_type_t::REBOOT}, rbuf[1])) {
+                shutdown_type_t::POWEROFF, shutdown_type_t::REBOOT}, rbuf[1])) {
             auto sd_type = static_cast<shutdown_type_t>(rbuf[1]);
 
             services->stop_all_services(sd_type);
@@ -117,14 +114,16 @@ bool control_conn_t::process_packet()
         return process_set_trigger();
     }
     if (pktType == DINIT_CP_CATLOG) {
-    	return process_catlog();
+        return process_catlog();
+    }
+    if (pktType == DINIT_CP_SIGNAL) {
+        return process_signal();
     }
 
     // Unrecognized: give error response
     char outbuf[] = { DINIT_RP_BADREQ };
-    if (! queue_packet(outbuf, 1)) return false;
+    if (!queue_packet(outbuf, 1)) return false;
     bad_conn_close = true;
-    iob.set_watches(OUT_EVENTS);
     return true;
 }
 
@@ -146,7 +145,6 @@ bool control_conn_t::process_find_load(int pktType)
         char badreqRep[] = { DINIT_RP_BADREQ };
         if (! queue_packet(badreqRep, 1)) return false;
         bad_conn_close = true;
-        iob.set_watches(OUT_EVENTS);
         return true;
     }
     chklen = svcSize + 3; // packet type + (2 byte) length + service name
@@ -270,7 +268,6 @@ bool control_conn_t::process_start_stop(int pktType)
         char badreqRep[] = { DINIT_RP_BADREQ };
         if (! queue_packet(badreqRep, 1)) return false;
         bad_conn_close = true;
-        iob.set_watches(OUT_EVENTS);
         return true;
     }
     else {
@@ -414,7 +411,6 @@ bool control_conn_t::process_unpin_service()
         char badreqRep[] = { DINIT_RP_BADREQ };
         if (! queue_packet(badreqRep, 1)) return false;
         bad_conn_close = true;
-        iob.set_watches(OUT_EVENTS);
         return true;
     }
 
@@ -452,20 +448,17 @@ bool control_conn_t::process_unload_service()
         char badreq_rep[] = { DINIT_RP_BADREQ };
         if (! queue_packet(badreq_rep, 1)) return false;
         bad_conn_close = true;
-        iob.set_watches(OUT_EVENTS);
         return true;
     }
 
     if (!service->has_lone_ref() || service->get_state() != service_state_t::STOPPED) {
         // Cannot unload: has other references
         char nak_rep[] = { DINIT_RP_NAK };
-        if (! queue_packet(nak_rep, 1)) return false;
+        if (!queue_packet(nak_rep, 1)) return false;
     }
     else {
-        // unload
-        service->prepare_for_unload();
-        services->remove_service(service);
-        delete service;
+        // unload (this may fail with bad_alloc)
+        services->unload_service(service);
 
         // drop handle
         service_key_map.erase(service);
@@ -473,7 +466,7 @@ bool control_conn_t::process_unload_service()
 
         // send ack
         char ack_buf[] = { (char) DINIT_RP_ACK };
-        if (! queue_packet(ack_buf, 1)) return false;
+        if (!queue_packet(ack_buf, 1)) return false;
     }
 
     // Clear the packet from the buffer
@@ -505,32 +498,23 @@ bool control_conn_t::process_reload_service()
         char badreq_rep[] = { DINIT_RP_BADREQ };
         if (! queue_packet(badreq_rep, 1)) return false;
         bad_conn_close = true;
-        iob.set_watches(OUT_EVENTS);
         return true;
     }
 
-    if (! service->has_lone_ref(false)) {
+    if (!service->has_lone_ref(false)) {
         // Cannot unload: has other references
         char nak_rep[] = { DINIT_RP_NAK };
         if (! queue_packet(nak_rep, 1)) return false;
     }
     else {
         try {
-            // reload
-            auto *new_service = services->reload_service(service);
-            if (new_service != service) {
-                service->prepare_for_unload();
-                services->replace_service(service, new_service);
-                delete service;
-            }
-            else {
-                service->remove_listener(this);
-            }
-
             // drop handle
             key_service_map.erase(handle);
             service_key_map.erase(service);
 
+            // reload
+            service->remove_listener(this);
+            services->reload_service(service);
             services->process_queues();
 
             // send ack
@@ -599,8 +583,9 @@ bool control_conn_t::list_services()
     try {
         auto slist = services->list_services();
         for (auto sptr : slist) {
+            if (sptr->get_type() == service_type_t::PLACEHOLDER) continue;
+
             std::vector<char> pkt_buf;
-            
             int hdrsize = 2 + STATUS_BUFFER_SIZE;
 
             const std::string &name = sptr->get_name();
@@ -687,20 +672,18 @@ bool control_conn_t::add_service_dep(bool do_enable)
     if (from_service == nullptr || to_service == nullptr || from_service == to_service) {
         // Service handle is bad
         char badreq_rep[] = { DINIT_RP_BADREQ };
-        if (! queue_packet(badreq_rep, 1)) return false;
+        if (!queue_packet(badreq_rep, 1)) return false;
         bad_conn_close = true;
-        iob.set_watches(OUT_EVENTS);
         return true;
     }
 
     // Check dependency type is valid:
     int dep_type_int = rbuf[1];
-    if (! contains({dependency_type::MILESTONE, dependency_type::REGULAR,
+    if (!contains({dependency_type::MILESTONE, dependency_type::REGULAR,
             dependency_type::WAITS_FOR}, dep_type_int)) {
         char badreqRep[] = { DINIT_RP_BADREQ };
-        if (! queue_packet(badreqRep, 1)) return false;
+        if (!queue_packet(badreqRep, 1)) return false;
         bad_conn_close = true;
-        iob.set_watches(OUT_EVENTS);
     }
     dependency_type dep_type = static_cast<dependency_type>(dep_type_int);
 
@@ -807,7 +790,6 @@ bool control_conn_t::rm_service_dep()
         char badreq_rep[] = { DINIT_RP_BADREQ };
         if (! queue_packet(badreq_rep, 1)) return false;
         bad_conn_close = true;
-        iob.set_watches(OUT_EVENTS);
         return true;
     }
 
@@ -818,7 +800,6 @@ bool control_conn_t::rm_service_dep()
         char badreqRep[] = { DINIT_RP_BADREQ };
         if (! queue_packet(badreqRep, 1)) return false;
         bad_conn_close = true;
-        iob.set_watches(OUT_EVENTS);
     }
     dependency_type dep_type = static_cast<dependency_type>(dep_type_int);
 
@@ -923,7 +904,6 @@ badreq:
     // Queue error response / mark connection bad
     if (! queue_packet(badreqRep, 1)) return false;
     bad_conn_close = true;
-    iob.set_watches(OUT_EVENTS);
     return true;
 }
 
@@ -963,9 +943,9 @@ bool control_conn_t::process_set_trigger()
 
 bool control_conn_t::process_catlog()
 {
-	// 1 byte packet type
-	// 1 byte reserved for future use
-	// handle
+    // 1 byte packet type
+    // 1 byte reserved for future use
+    // handle
     constexpr int pkt_size = 2 + sizeof(handle_t);
 
     if (rbuf.get_length() < pkt_size) {
@@ -974,15 +954,16 @@ bool control_conn_t::process_catlog()
     }
 
     handle_t handle;
+    char flags = rbuf[1];
 
-    rbuf.extract(&handle, 1, sizeof(handle));
+    rbuf.extract(&handle, 2, sizeof(handle));
     rbuf.consume(pkt_size);
     chklen = 0;
 
     service_record *service = find_service_for_key(handle);
     if (service == nullptr || (service->get_type() != service_type_t::PROCESS
-    		&& service->get_type() != service_type_t::BGPROCESS
-			&& service->get_type() != service_type_t::SCRIPTED)) {
+            && service->get_type() != service_type_t::BGPROCESS
+            && service->get_type() != service_type_t::SCRIPTED)) {
         char nak_rep[] = { DINIT_RP_NAK };
         return queue_packet(nak_rep, 1);
     }
@@ -997,10 +978,61 @@ bool control_conn_t::process_catlog()
     const char *bufaddr = buffer_details.first;
     unsigned buflen = buffer_details.second;
 
-    std::vector<char> pkt = { (char)DINIT_RP_SERVICE_LOG };
+    std::vector<char> pkt = { (char)DINIT_RP_SERVICE_LOG, 0 /* flags; reserved for future */ };
     pkt.insert(pkt.end(), (char *)(&buflen), (char *)(&buflen + 1));
     pkt.insert(pkt.end(), bufaddr, bufaddr + buflen);
+    if ((flags & 1) != 0) {
+        bps->clear_log_buffer();
+    }
     return queue_packet(std::move(pkt));
+}
+
+bool control_conn_t::process_signal()
+{
+    // packet contains signal number and process handle
+    constexpr int pkt_size = 1 + sizeof(int) + sizeof(handle_t);
+    if (rbuf.get_length() < pkt_size) {
+        chklen = pkt_size;
+        return true;
+    }
+
+    int sig_num;
+    rbuf.extract((char *) &sig_num, 1, sizeof(sig_num));
+    handle_t handle;
+    rbuf.extract((char *) &handle, 1 + sizeof(sig_num), sizeof(handle));
+    rbuf.consume(pkt_size);
+    chklen = 0;
+
+    service_record *service = find_service_for_key(handle);
+    if (service == nullptr) {
+        char nak_rep[] = { DINIT_RP_NAK };
+        return queue_packet(nak_rep, 1);
+    }
+
+    // Reply:
+    // 1 byte packet type = DINIT_RP_*
+
+    pid_t spid = service->get_pid();
+    // we probably don't want to kill/signal every process (in the current group),
+    // but get_pid() sometimes returns -1 if e.g. service is not 'started'
+    if (spid == -1 || spid == 0) {
+        char nak_rep[] = { DINIT_RP_SIGNAL_NOPID };
+        return queue_packet(nak_rep, 1);
+    }
+    else {
+        if (bp_sys::kill(spid, sig_num) != 0) {
+            if (errno == EINVAL) {
+                log(loglevel_t::ERROR, "Requested signal not in valid signal range.");
+                char nak_rep[] = { DINIT_RP_SIGNAL_BADSIG };
+                return queue_packet(nak_rep, 1);
+            }
+            log(loglevel_t::ERROR, "Error sending signal to process: ", strerror(errno));
+            char nak_rep[] = { DINIT_RP_SIGNAL_KILLERR };
+            return queue_packet(nak_rep, 1);
+        }
+    }
+    char ack_rep[] = { DINIT_RP_ACK };
+    return queue_packet(ack_rep, 1);
 }
 
 bool control_conn_t::query_load_mech()
@@ -1144,7 +1176,6 @@ void control_conn_t::service_event(service_record *service, service_event_t even
 
 bool control_conn_t::queue_packet(const char *pkt, unsigned size) noexcept
 {
-    int in_flag = bad_conn_close ? 0 : IN_EVENTS;
     bool was_empty = outbuf.empty();
 
     // If the queue is empty, we can try to write the packet out now rather than queueing it.
@@ -1164,7 +1195,6 @@ bool control_conn_t::queue_packet(const char *pkt, unsigned size) noexcept
         else {
             if ((unsigned)wr == size) {
                 // Ok, all written.
-                iob.set_watches(in_flag);
                 return true;
             }
             pkt += wr;
@@ -1175,7 +1205,7 @@ bool control_conn_t::queue_packet(const char *pkt, unsigned size) noexcept
     // Create a vector out of the (remaining part of the) packet:
     try {
         outbuf.emplace_back(pkt, pkt + size);
-        iob.set_watches(in_flag | OUT_EVENTS);
+        outbuf_size += size;
         return true;
     }
     catch (std::bad_alloc &baexc) {
@@ -1189,7 +1219,6 @@ bool control_conn_t::queue_packet(const char *pkt, unsigned size) noexcept
             return false;
         }
         else {
-            iob.set_watches(OUT_EVENTS);
             return true;
         }
     }
@@ -1199,7 +1228,6 @@ bool control_conn_t::queue_packet(const char *pkt, unsigned size) noexcept
 // make them extraordinary difficult to combine into a single method.
 bool control_conn_t::queue_packet(std::vector<char> &&pkt) noexcept
 {
-    int in_flag = bad_conn_close ? 0 : IN_EVENTS;
     bool was_empty = outbuf.empty();
     
     if (was_empty) {
@@ -1219,7 +1247,6 @@ bool control_conn_t::queue_packet(std::vector<char> &&pkt) noexcept
         else {
             if ((unsigned)wr == pkt.size()) {
                 // Ok, all written.
-                iob.set_watches(in_flag);
                 return true;
             }
             outpkt_index = wr;
@@ -1227,8 +1254,8 @@ bool control_conn_t::queue_packet(std::vector<char> &&pkt) noexcept
     }
     
     try {
-        outbuf.emplace_back(pkt);
-        iob.set_watches(in_flag | OUT_EVENTS);
+        outbuf.emplace_back(std::move(pkt));
+        outbuf_size += pkt.size();
         return true;
     }
     catch (std::bad_alloc &baexc) {
@@ -1242,7 +1269,6 @@ bool control_conn_t::queue_packet(std::vector<char> &&pkt) noexcept
             return false;
         }
         else {
-            iob.set_watches(OUT_EVENTS);
             return true;
         }
     }
@@ -1281,11 +1307,6 @@ bool control_conn_t::data_ready() noexcept
         // Too big packet
         log(loglevel_t::WARN, "Received too-large control packet; dropping connection");
         bad_conn_close = true;
-        iob.set_watches(OUT_EVENTS);
-    }
-    else {
-        int out_flags = (bad_conn_close || !outbuf.empty()) ? OUT_EVENTS : 0;
-        iob.set_watches(IN_EVENTS | out_flags);
     }
     
     return false;
@@ -1323,17 +1344,15 @@ bool control_conn_t::send_data() noexcept
     outpkt_index += written;
     if (outpkt_index == pkt.size()) {
         // We've finished this packet, move on to the next:
+        outbuf_size -= pkt.size();
         outbuf.pop_front();
         outpkt_index = 0;
         if (oom_close) {
             // remain active, try to send DINIT_RP_OOM shortly
             return false;
         }
-        if (outbuf.empty()) {
-            if (bad_conn_close) {
-                return true;
-            }
-            iob.set_watches(IN_EVENTS);
+        if (outbuf.empty() && bad_conn_close) {
+            return true;
         }
     }
     

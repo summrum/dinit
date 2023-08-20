@@ -7,11 +7,16 @@
 #include "dinit.h"
 #include "service.h"
 #include "baseproc-sys.h"
+#include "proc-service.h"
 #include "control.h"
 
 #include "../test_service.h"
+#include "../test_procservice.h"
 
 // Control protocol tests.
+#ifdef NDEBUG
+#error "This file must be built with assertions ENABLED!"
+#endif
 
 class control_conn_t_test
 {
@@ -27,84 +32,84 @@ constexpr static int STATUS_BUFFER_SIZE = 6 + ((sizeof(pid_t) > sizeof(int)) ? s
 
 void cptest_queryver()
 {
-	service_set sset;
-	int fd = bp_sys::allocfd();
-	auto *cc = new control_conn_t(event_loop, &sset, fd);
+    service_set sset;
+    int fd = bp_sys::allocfd();
+    auto *cc = new control_conn_t(event_loop, &sset, fd);
 
-	bp_sys::supply_read_data(fd, { DINIT_CP_QUERYVERSION });
+    bp_sys::supply_read_data(fd, { DINIT_CP_QUERYVERSION });
 
-	event_loop.regd_bidi_watchers[fd]->read_ready(event_loop, fd);
+    event_loop.regd_bidi_watchers[fd]->read_ready(event_loop, fd);
 
-	// Write will process immediately, so there's no need for this:
-	//event_loop.regd_bidi_watchers[fd]->write_ready(event_loop, fd);
+    // Write will process immediately, so there's no need for this:
+    //event_loop.regd_bidi_watchers[fd]->write_ready(event_loop, fd);
 
-	// We expect a version number back:
-	std::vector<char> wdata;
-	bp_sys::extract_written_data(fd, wdata);
+    // We expect a version number back:
+    std::vector<char> wdata;
+    bp_sys::extract_written_data(fd, wdata);
 
-	assert(wdata.size() == 5);
-	assert(wdata[0] == DINIT_RP_CPVERSION);
+    assert(wdata.size() == 5);
+    assert(wdata[0] == DINIT_RP_CPVERSION);
 
-	delete cc;
+    delete cc;
 }
 
 void cptest_listservices()
 {
-	service_set sset;
+    service_set sset;
 
-	service_record *s1 = new service_record(&sset, "test-service-1", service_type_t::INTERNAL, {});
-	sset.add_service(s1);
-	service_record *s2 = new service_record(&sset, "test-service-2", service_type_t::INTERNAL, {});
-	sset.add_service(s2);
-	service_record *s3 = new service_record(&sset, "test-service-3", service_type_t::INTERNAL, {});
-	sset.add_service(s3);
+    service_record *s1 = new service_record(&sset, "test-service-1", service_type_t::INTERNAL, {});
+    sset.add_service(s1);
+    service_record *s2 = new service_record(&sset, "test-service-2", service_type_t::INTERNAL, {});
+    sset.add_service(s2);
+    service_record *s3 = new service_record(&sset, "test-service-3", service_type_t::INTERNAL, {});
+    sset.add_service(s3);
 
-	int fd = bp_sys::allocfd();
-	auto *cc = new control_conn_t(event_loop, &sset, fd);
+    int fd = bp_sys::allocfd();
+    auto *cc = new control_conn_t(event_loop, &sset, fd);
 
-	bp_sys::supply_read_data(fd, { DINIT_CP_LISTSERVICES });
+    bp_sys::supply_read_data(fd, { DINIT_CP_LISTSERVICES });
 
-	event_loop.regd_bidi_watchers[fd]->read_ready(event_loop, fd);
+    event_loop.regd_bidi_watchers[fd]->read_ready(event_loop, fd);
 
-	// Write will process immediately, so there's no need for this:
-	//event_loop.regd_bidi_watchers[fd]->write_ready(event_loop, fd);
+    // Write will process immediately, so there's no need for this:
+    //event_loop.regd_bidi_watchers[fd]->write_ready(event_loop, fd);
 
-	// We expect, for each service:
-	// (1 byte)   DINIT_RP_SVCINFO
-	// (1 byte)   service name length
-	// (1 byte)   state
-	// (1 byte)   target state
-	// (1 byte)   flags: has console, waiting for console, start skipped
-	// (1 byte)   stop reason
+    // We expect, for each service:
+    // (1 byte)   DINIT_RP_SVCINFO
+    // (1 byte)   service name length
+    // (1 byte)   state
+    // (1 byte)   target state
+    // (1 byte)   flags: has console, waiting for console, start skipped
+    // (1 byte)   stop reason
     // (2 bytes)  reserved
-	// (? bytes)  exit status (int) / process id (pid_t)
-	// (N bytes)  service name
+    // (? bytes)  exit status (int) / process id (pid_t)
+    // (N bytes)  service name
 
-	std::vector<char> wdata;
-	bp_sys::extract_written_data(fd, wdata);
+    std::vector<char> wdata;
+    bp_sys::extract_written_data(fd, wdata);
 
-	std::set<std::string> names = {"test-service-1", "test-service-2", "test-service-3"};
+    std::set<std::string> names = {"test-service-1", "test-service-2", "test-service-3"};
 
-	int pos = 0;
-	for (int i = 0; i < 3; i++) {
-		assert(wdata[pos++] == DINIT_RP_SVCINFO);
-		unsigned char name_len_c = wdata[pos++];
-		pos += 6;
+    int pos = 0;
+    for (int i = 0; i < 3; i++) {
+        assert(wdata[pos++] == DINIT_RP_SVCINFO);
+        unsigned char name_len_c = wdata[pos++];
+        pos += 6;
 
-		pos += std::max(sizeof(int), sizeof(pid_t));
+        pos += std::max(sizeof(int), sizeof(pid_t));
 
-		std::string name;
-		for (int j = 0; j < (int)name_len_c; j++) {
-			name += wdata[pos++];
-		}
+        std::string name;
+        for (int j = 0; j < (int)name_len_c; j++) {
+            name += wdata[pos++];
+        }
 
-		// Check the service name matches one from the set, and remove it:
-		auto fn = names.find(name);
-		assert (fn != names.end());
-		names.erase(fn);
-	}
+        // Check the service name matches one from the set, and remove it:
+        auto fn = names.find(name);
+        assert (fn != names.end());
+        names.erase(fn);
+    }
 
-	delete cc;
+    delete cc;
 }
 
 static control_conn_t::handle_t  find_service(int fd, const char *service_name,
@@ -951,6 +956,76 @@ void cptest_servicestatus()
     delete cc;
 }
 
+void cptest_sendsignal()
+{
+    using namespace std;
+
+    service_set sset;
+    ha_string command = "test-command";
+    list<pair<unsigned,unsigned>> command_offsets;
+    command_offsets.emplace_back(0, command.length());
+    std::list<prelim_dep> depends;
+
+    process_service p {&sset, "test-service", std::move(command), command_offsets, depends};
+    init_service_defaults(p);
+    sset.add_service(&p);
+
+    p.start();
+    sset.process_queues();
+    base_process_service_test::exec_succeeded(&p);
+    sset.process_queues();
+
+    int fd = bp_sys::allocfd();
+    auto *cc = new control_conn_t(event_loop, &sset, fd);
+
+    // Get a service handle:
+    control_conn_t::handle_t h = find_service(fd, "test-service", service_state_t::STARTED,
+            service_state_t::STARTED);
+
+    // Prepare a signal: (SIGHUP for example)
+    int sig = SIGHUP;
+
+    // Issue a signal:
+    std::vector<char> cmd = { DINIT_CP_SIGNAL };
+    char * sig_cp = reinterpret_cast<char *>(&sig);
+    char * h_cp = reinterpret_cast<char *>(&h);
+    cmd.insert(cmd.end(), sig_cp, sig_cp + sizeof(sig));
+    cmd.insert(cmd.end(), h_cp, h_cp + sizeof(h));
+
+    bp_sys::supply_read_data(fd, std::move(cmd));
+    event_loop.regd_bidi_watchers[fd]->read_ready(event_loop, fd);
+
+    std::vector<char> wdata;
+    bp_sys::extract_written_data(fd, wdata);
+    assert(wdata.size() == 1);
+    assert(wdata[0] == DINIT_RP_ACK);
+
+    assert(bp_sys::last_sig_sent == SIGHUP);
+
+    // Prepare an another signal: (for sure)
+    sig = SIGILL;
+
+    // Issue a signal:
+    cmd = { DINIT_CP_SIGNAL };
+    sig_cp = reinterpret_cast<char *>(&sig);
+    cmd.insert(cmd.end(), sig_cp, sig_cp + sizeof(sig));
+    cmd.insert(cmd.end(), h_cp, h_cp + sizeof(h));
+
+    bp_sys::supply_read_data(fd, std::move(cmd));
+    event_loop.regd_bidi_watchers[fd]->read_ready(event_loop, fd);
+
+    wdata.clear();
+    bp_sys::extract_written_data(fd, wdata);
+    assert(wdata.size() == 1);
+    assert(wdata[0] == DINIT_RP_ACK);
+
+    assert(bp_sys::last_sig_sent == SIGILL);
+
+    sset.remove_service(&p);
+
+    delete cc;
+}
+
 
 #define RUN_TEST(name, spacing) \
     std::cout << #name "..." spacing << std::flush; \
@@ -975,5 +1050,6 @@ int main(int argc, char **argv)
     RUN_TEST(cptest_restart, "            ");
     RUN_TEST(cptest_wake, "               ");
     RUN_TEST(cptest_servicestatus, "      ");
+    RUN_TEST(cptest_sendsignal, "         ");
     return 0;
 }

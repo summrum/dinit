@@ -2,11 +2,10 @@
 project(
     'dinit', 
     'cpp', 
-    version : run_command(
-        ['sh', 'build/general_variables_for_meson.sh', 'version'],
-        check : true).stdout(),
+    version : run_command('grep', '^VERSION=', 'build/version.conf',
+        check : true).stdout().strip().split('=')[1],
     license : 'Apache-2.0',
-    meson_version : '>= 0.47.0',
+    meson_version : '>= 0.56.0',
     default_options : [
         'cpp_std=c++11',
         'optimization=s',
@@ -14,13 +13,17 @@ project(
     ]
 )
 
+## Import variables from build/version.conf
+kv = import('keyval')
+version_conf = kv.load('build/version.conf')
+
 ## General Defines
 compiler = meson.get_compiler('cpp')
 mconfig_data = configuration_data()
 version = meson.project_version()
 platform = host_machine.system()
-month = run_command('build/general_variables_for_meson.sh', 'month', check : true).stdout()
-year = run_command('build/general_variables_for_meson.sh', 'year', check : true).stdout()
+month = version_conf.get('MONTH')
+year = version_conf.get('YEAR')
 build_shutdown = get_option('build-shutdown')
 shutdown_prefix = get_option('shutdown-prefix')
 dinit_control_socket_path = get_option('dinit-control-socket-path')
@@ -30,6 +33,10 @@ fuzzer = get_option('fuzzer')
 man_pages = get_option('man-pages')
 support_cgroups = get_option('support-cgroups')
 use_utmpx = get_option('use-utmpx')
+use_initgroups = get_option('use-initgroups')
+default_auto_restart = get_option('default-auto-restart').to_string()
+default_start_timeout = get_option('default-start-timeout').to_string()
+default_stop_timeout = get_option('default-stop-timeout').to_string()
 # We have custom sbindir for install programs (/sbin instead of /usr/sbin/ by default)
 # By default: Prefix = /usr
 # By default: Sbin = /sbin
@@ -41,7 +48,7 @@ mandir = get_option('mandir')
 
 ## If Meson's default sbindir is modifed; Warn users about it:
 if get_option('sbindir') != 'sbin'
-    warning('Seems like Default "sbindir" is modified. Dinit dont follow Default "sbindir" option. Please use "dinit-sbindir" option instead!')
+    warning('It appears that "sbindir" has been set/modified. Dinit\'s build doesn\'t use the "sbindir" option. Please use "dinit-sbindir" option instead!')
 endif
 
 ## Use -lrt?
@@ -51,10 +58,14 @@ if platform == 'freebsd' and compiler.has_link_argument('-lrt')
 endif
 
 ## Prepare mconfig.h
-mconfig_data.set('DINIT_VERSION', '"' + meson.project_version() + '"')
-mconfig_data.set('SYSCONTROLSOCKET', '"' + dinit_control_socket_path + '"')
-mconfig_data.set('SBINDIR', '"' + sbindir + '"')
-mconfig_data.set('SHUTDOWN_PREFIX', '"' + shutdown_prefix + '"')
+mconfig_data.set_quoted('DINIT_VERSION', version)
+mconfig_data.set_quoted('SYSCONTROLSOCKET', dinit_control_socket_path)
+mconfig_data.set_quoted('SBINDIR', sbindir)
+mconfig_data.set_quoted('SHUTDOWN_PREFIX', shutdown_prefix)
+mconfig_data.set('DEFAULT_AUTO_RESTART', default_auto_restart)
+mconfig_data.set('DEFAULT_START_TIMEOUT', default_start_timeout)
+mconfig_data.set('DEFAULT_STOP_TIMEOUT', default_stop_timeout)
+mconfig_data.set10('USE_INITGROUPS', use_initgroups)
 if support_cgroups.auto() and platform == 'linux' or support_cgroups.enabled()
     mconfig_data.set('SUPPORT_CGROUPS', '1') 
 endif
@@ -63,6 +74,11 @@ if use_utmpx.enabled()
 elif use_utmpx.disabled()
     mconfig_data.set('USE_UTMPX', '0')
 endif
+configure_file(
+    input : 'build/mconfig.mesontemplate',
+    output : 'mconfig.h',
+    configuration : mconfig_data
+)
 
 ## Outputs
 subdir('src')

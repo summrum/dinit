@@ -18,6 +18,8 @@
 
 // Control connection for dinit
 
+constexpr int OUTBUF_LIMIT = 16384; // Output buffer high-water mark
+
 class control_conn_t;
 class control_conn_watcher;
 
@@ -109,8 +111,10 @@ class control_conn_t : private service_listener
     std::unordered_multimap<service_record *, handle_t> service_key_map;
     std::map<handle_t, service_record *> key_service_map;
     
-    // Buffer for outgoing packets. Each outgoing back is represented as a vector<char>.
+    // Buffer for outgoing packets. Each outgoing packet is represented as a vector<char>.
     list<vector<char>> outbuf;
+    // Current output buffer size in bytes.
+    unsigned outbuf_size = 0;
     // Current index within the first outgoing packet (all previous bytes have been sent).
     unsigned outpkt_index = 0;
     
@@ -161,6 +165,9 @@ class control_conn_t : private service_listener
     // Process a CATLOG packet.
     bool process_catlog();
 
+    // Process a SIGNAL packet.
+    bool process_signal();
+
     // List all loaded services and their state.
     bool list_services();
 
@@ -181,7 +188,7 @@ class control_conn_t : private service_listener
     bool data_ready() noexcept;
     
     bool send_data() noexcept;
-    
+
     // Check if any dependents will be affected by stopping a service, generate a response packet if so.
     // had_dependents will be set true if the service should not be stopped, false otherwise.
     // Returns false if the connection must be closed, true otherwise.
@@ -206,7 +213,6 @@ class control_conn_t : private service_listener
     {
         bad_conn_close = true;
         oom_close = true;
-        iob.set_watches(dasynq::OUT_EVENTS);
     }
     
     // Process service event broadcast.
@@ -250,6 +256,16 @@ inline dasynq::rearm control_conn_cb(eventloop_t * loop, control_conn_watcher * 
         }
     }
     
+    // Accept more commands unless the output buffer high water mark is exceeded
+    int watch_flags = 0;
+    if (!conn->bad_conn_close && conn->outbuf_size < OUTBUF_LIMIT) {
+        watch_flags |= dasynq::IN_EVENTS;
+    }
+    if (!conn->outbuf.empty() || conn->bad_conn_close) {
+        watch_flags |= dasynq::OUT_EVENTS;
+    }
+    watcher->set_watches(watch_flags);
+
     return dasynq::rearm::NOOP;
 }
 

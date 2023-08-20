@@ -20,7 +20,7 @@
  * See service.h for details.
  */
 
-// Find the requested service by name
+// Find the requested service by name.
 static service_record * find_service(const std::list<service_record *> & records,
                                     const char *name) noexcept
 {
@@ -34,9 +34,42 @@ static service_record * find_service(const std::list<service_record *> & records
     return nullptr;
 }
 
-service_record * service_set::find_service(const std::string &name) noexcept
+service_record * service_set::find_service(const std::string &name, bool find_placeholders) noexcept
 {
-    return ::find_service(records, name.c_str());
+    service_record *r = ::find_service(records, name.c_str());
+    if (r != nullptr && !find_placeholders && r->get_type() == service_type_t::PLACEHOLDER) {
+        return nullptr;
+    }
+    return r;
+}
+
+void service_record::prepare_for_unload() noexcept
+{
+    // Remove all dependencies:
+    for (auto &dep : depends_on) {
+        service_record *dependency = dep.get_to();
+        auto &dep_dpts = dependency->dependents;
+        dep_dpts.erase(std::find(dep_dpts.begin(), dep_dpts.end(), &dep));
+        if (dep.dep_type == dependency_type::AFTER) {
+            if (dependency->get_type() == service_type_t::PLACEHOLDER) {
+                if (dependency->is_unrefd()) {
+                    services->remove_service(dependency);
+                    delete dependency;
+                }
+            }
+        }
+    }
+    depends_on.clear();
+
+    // Also remove all dependents. This should not be necessary except for "before" links.
+    for (auto i = dependents.begin(); i != dependents.end();) {
+        service_record *before_svc = (*i)->get_from();
+        before_svc->rm_dep(**i++);
+        if (before_svc->get_type() == service_type_t::PLACEHOLDER && before_svc->is_unrefd()) {
+            services->remove_service(before_svc);
+            delete before_svc;
+        }
+    }
 }
 
 // Called when a service has actually stopped; dependents have stopped already, unless this stop
@@ -166,7 +199,7 @@ void service_record::release(bool issue_stop) noexcept
 
         if (service_state != service_state_t::STOPPED && service_state != service_state_t::STOPPING
                 && issue_stop) {
-        	stop_reason = stopped_reason_t::NORMAL;
+            stop_reason = stopped_reason_t::NORMAL;
             do_stop();
         }
     }
@@ -208,7 +241,7 @@ void service_record::initiate_start() noexcept
     waiting_for_deps = true;
 
     if (start_check_dependencies()) {
-        waiting_for_deps = false;
+        // Note: we can't set waiting_for_deps false here since ordering dependencies might still kick in
         services->add_transition_queue(this);
     }
 }
@@ -280,6 +313,7 @@ void service_record::execute_transition() noexcept
 {
     if (service_state == service_state_t::STARTING) {
         if (check_deps_started()) {
+            waiting_for_deps = false;
             all_deps_started();
         }
     }
@@ -373,6 +407,15 @@ bool service_record::start_check_dependencies() noexcept
         if (to->service_state != service_state_t::STARTED) {
             dep.waiting_on = true;
             all_deps_started = false;
+        }
+    }
+
+    for (auto * dept : dependents) {
+        if (!dept->waiting_on && dept->is_only_ordering()) {
+            service_record *from = dept->get_from();
+            if (from->get_state() == service_state_t::STARTING) {
+                dept->waiting_on = true;
+            }
         }
     }
 
@@ -575,7 +618,7 @@ void service_record::stop(bool bring_down) noexcept
     if (bring_down && service_state != service_state_t::STOPPED) {
         // Note even if we are already STOPPING we should call do_stop for the case where we need
         // to interrupt any currently ongoing restart of dependents.
-    	stop_reason = stopped_reason_t::NORMAL;
+        stop_reason = stopped_reason_t::NORMAL;
         do_stop();
     }
 }

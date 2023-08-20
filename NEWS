@@ -5,18 +5,74 @@ Current sponsors include github users: brentfrow, brazeon, and q66 (Daniel Koles
 Chimera Linux). Development of Dinit has also received financial support from Artix Linux.
 I am grateful for all the support, both financial and otherwise, that has been received.
 
-Changes:
- * ... TBC
+Special thanks to Mobin Aydinfar, who has taken on secondary maintainer duties in the lead-up to
+this release, including many valuable contributions to getting CI infrastructure up-and-running.
+
+New features:
+ * A "log-type" service setting allows for control over how a service output is processed. A new
+   "buffer" type allows capturing service output to an in-memory buffer; this may be useful for
+   service started early, before any logging daemon is available. The buffer contents can be
+   inspected via a new dinitctl subcommand, "catlog". See dinit-service(5) and dinitctl(8). Other
+   log-type settings are "none", "file" (log to file as in previous versions) and "pipe" which
+   allows piping output to another (process) service - read on for details.
+ * Output from a service process can now be chained to another process (in another service).
+   This allows one service to act as a logging agent for another, for example. The consumer
+   service need not be started at the same time as the producer process; the pipe between them can
+   be created early if needed, and will persist if either end dies (so restarting a logging agent
+   without losing log messages should be possible in theory). The "consumer-of" service setting,
+   specified in the consumer, creates the connection between the services; the producer must have
+   log-type of "pipe".
  * New "triggered" service type, similar to "internal" except that it requires an external
    trigger before it will start (start of a triggered service is delayed until the external
-   trigger is received).
+   trigger is received). One potential use is to start services after hardware device nodes become
+   available (eg, start dhcp client on a network interface once it is available).
+ * New "dinictl" subcommand, "signal", to send a signal to a service process. See dinitctl(8).
+   Implemented by James Knippes and Mobin Aydinfar.
  * New "kill-all-on-stop" service option will cause dinit to kill all (other) processes just
    before stopping the service. This can be used to ensure a cleaner system state and that
    filesystems can be unmounted (for example). Use with care; see dinit-service(5) for details.
- * "shutdown" now runs (if present) user-provided shutdown hooks; see shutdown(8) for details.
- * "dinitctl" now supports the "--use-passed-cfd" argument (as for shutdown).
+ * The "shutdown" utility now runs (if present) user-provided shutdown hooks; see shutdown(8) for
+   details.
+ * New service settings to control service logfile ownership and permissions: logfile-permissions,
+   logfile-uid, and logfile-gid. Note that these have default values, which results in a change in
+   behaviour from previous versions even if they are not specified in a service description (i.e.
+   the logfile ownership and permissions are now always set).
+ * A new "--offline" option for dinitctl enables using "enable" and "disable" subcommands to
+   enable/disable services when dinit is not running.
+ * "before" and "after" ordering requirements in service descriptions no longer force the named
+   service to be loaded. This means that a service can be "before" another service even if the
+   other service might not be installed, for example.
+ * New "dinitctl" subcommands "is-started" and "is-failed", to test for specific service statuses
+   (intended to be useful in scripts, for example). Contributed by Daniel Kolesa.
+ * The "dinitctl" utility now supports the "--use-passed-cfd" argument (as for shutdown).
+ * A "configure" script to generate suitable build configuration is included. It is used by
+   default when building on not-recognised systems. Contributed by Mobin Aydinfar.
  * Meson build system added (as an alternative to the existing makefile-based build) by Mobin
    Aydinfar.
+
+Changes:
+ * The default is now to restart services automatically (previously required "restart = yes").
+ * The permissions/ownership for logfiles has been reworked, see details in "New features" above.
+ * Services which specify "run-as" to run as a different user now run with the supplementary
+   groups of that user (this can be disabled at build time by setting USE_INITGROUPS=0).
+   Thanks to Daniel Kolesa.
+ * Environment variables from the service-specific environment ("env-file" setting) can now be
+   substituted in many service settings. Variable expansion now supports a limited subset of shell
+   expansions (such as "$(NAME:-word}" and "${NAME:+word}). Behaviour is not identical to shell;
+   see documentation. Implemented by Daniel Kolesa.
+ * Environment variable expansion in service descriptions is no longer optional. The "sub-vars"
+   load option no in a service description no longer has any effect, and "no-sub-vars" is no
+   longer recognised at all.
+ * "/run/dinit.d" is now included in the default set of directories search for service description
+   files (in system mode).
+ * Some service defaults, including automatic restart, can now be configured at build time
+   (contributed by Mobin Aydinfar).
+
+Fixes:
+ * A bug in Dasynq which caused out-of-bounds vector access in dinit on shutdown has been fixed.
+ * Fixed a dinit bug that could cause communication on a control socket to block indefinitely,
+   which could theoretically cause dinitctl to hang (no cases of dinitctl hanging have been
+   reported by users!).
 
 == Version 0.16.1
 

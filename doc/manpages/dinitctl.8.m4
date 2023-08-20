@@ -18,10 +18,10 @@ dinitctl \- control services supervised by Dinit
 [\fIoptions\fR] \fBstatus\fR \fIservice-name\fR
 .HP
 .B dinitctl
-[\fIoptions\fR] \fBis-active\fR \fIservice-name\fR
+[\fIoptions\fR] \fBis\-started\fR \fIservice-name\fR
 .HP
 .B dinitctl
-[\fIoptions\fR] \fBis-failed\fR \fIservice-name\fR
+[\fIoptions\fR] \fBis\-failed\fR \fIservice-name\fR
 .HP
 .B dinitctl
 [\fIoptions\fR] \fBrestart\fR [\fB\-\-no\-wait\fR] [\fB\-\-ignore\-unstarted\fR] \fIservice-name\fR
@@ -67,6 +67,12 @@ dinitctl \- control services supervised by Dinit
 .HP
 .B dinitctl
 [\fIoptions\fR] \fBsetenv\fR [\fIname\fR[=\fIvalue\fR] \fI...\fR]
+.HP
+.B dinitctl
+[\fIoptions\fR] \fBcatlog\fR [\fB--clear\fR] \fIservice-name\fR
+.HP
+.B dinitctl
+[\fIoptions\fR] \fBsignal\fR { \fIsignal-id\fR \fIservice-name\fR | \fB\-\-list\fR | \fB-l\fR }
 .\"
 .PD
 .hy
@@ -109,7 +115,18 @@ The file descriptor with the connection is identified by the contents of the DIN
 environment variable.
 .TP
 \fB\-\-quiet\fR
-Suppress status output, except for errors. 
+Suppress status output, except for errors.
+.TP
+\fB\-\-offline\fR, \fB\-o\fR
+Work "offline", without communicating with the \fBdinit\fR daemon.
+This is applicable only for the \fBenable\fR and \fBdisable\fR subcommands.
+.TP
+\fB\-\-services\-dir\fR \fIdir\fP, \fB\-d\fR \fIdir\fP
+Specifies \fIdir\fP as the directory containing service description files (can
+be given multiple times to specify multiple service directories).
+Default directories are not searched for services when this option is provided.
+This option is ignored when \fB\-\-offline\fR (\fB\-o\fR) is not also specified (otherwise,
+\fBdinitctl\fR can query the \fBdinit\fR daemon for the service description directories).
 .\"
 .SH COMMAND OPTIONS
 .TP
@@ -130,8 +147,8 @@ will automatically stop. If a pinned-started service fails to start, the pin is 
 .sp
 Note that a pin takes effect while the service is starting/stopping, before it reaches the target
 state. Stopping or restarting a service that is pinned started and which is already starting or
-started is not possible. Similarly, starting a service which is pinned stopped and which is stopping
-or stopped is not possible.
+started is not possible.
+Similarly, starting a service which is pinned stopped and which is stopping or stopped is not possible.
 .TP
 \fB\-\-force\fR
 Stop the service even if it will require stopping other services which depend on the specified service.
@@ -141,8 +158,14 @@ When applied to the \fBrestart\fR command, this will cause the dependent service
 If the service is not started or doesn't exist, ignore the command and return an exit code indicating
 success.
 .TP
+\fB\-\-clear\fR
+Clear the log buffer for the service after displaying it.
+.TP
 \fIservice-name\fR
 Specifies the name of the service to which the command applies.
+.\"
+.SH COMMAND DESCRIPTIONS
+.\"
 .TP
 \fBstart\fR
 Start the specified service.
@@ -152,8 +175,9 @@ If the service is currently stopping it will generally continue to stop before i
 \fBstop\fR
 Stop the specified service, and remove explicit activation.
 If the service has (non-soft) dependents, an error will be displayed and no further action taken,
-unless the \fB\-\-force\fR option is used. If the service is pinned started (and not already stopped or
-stopping) an error will be displayed and no further action taken.
+unless the \fB\-\-force\fR option is used.
+If the service is pinned started (and not already stopped or stopping) an error will be displayed
+and no further action taken.
 .sp
 The \fBrestart\fR option (see \fBdinit-service\fR(5)) applied to the stopped service will not cause the
 service to restart when it is stopped via this command (that is, this command inhibits automatic restart).
@@ -171,18 +195,19 @@ ID (pid) if applicable.
 If the service is stopped for any reason other than a normal stop, the reason for the service
 stopping will be displayed (along with any further relevant information, if available).
 .TP
-\fBis-active\fR
-Check if the specified service is currently active.
-The service counts as active if it is known it is currently started. Any other state, including
-protocol and parse errors, will exit without returning success. Unless quiet, the current service
-status (STOPPED, STARTING, STARTED, STOPPING) is printed out to standard output.
+\fBis\-started\fR
+Check if the specified service is currently started.
+Any other state (including if the service is currently starting or stopping) will exit without returning success.
+Unless \fB\-\-quiet\fR is specified, the current service status (STOPPED, STARTING, STARTED, STOPPING)
+will be printed to standard output.
 .TP
-\fBis-failed\fR
+\fBis\-failed\fR
 Check if the specified service is currently failed.
 The service counts as failed if it is known it is currently stopped either because of startup
-failure, timeout or dependency failure. Any other state, including protocol and parse errors,
-will exit without returning success. Unless quiet, the current srevice status is printed out
-to standard output like with \fBis-active\fR.
+failure, timeout or dependency failure.
+Any other state, including protocol and parse errors, will exit without returning success.
+Unless \fB\-\-quiet\fR is specified, the current service status (STOPPED, STARTING, STARTED, STOPPING)
+will be printed to standard output.
 .TP
 \fBrestart\fR
 Restart the specified service. The service will be stopped and then restarted, without affecting explicit
@@ -287,8 +312,8 @@ This will allow the service to finish starting.
 .TP
 \fBuntrigger\fR
 Clear the trigger for the specified service (which must be a \fItriggered\fR service).
-This will delay the service from starting, until the trigger is set. If the service has already started,
-this will have no immediate effect.
+This will delay the service from starting, until the trigger is set.
+If the service has already started, this will have no immediate effect.
 .TP
 \fBsetenv\fR
 Export one or more variables into the activation environment.
@@ -296,6 +321,20 @@ The value can be provided on the command line or retrieved from the environment 
 called in.
 Any subsequently started or restarted service will have these environment variables available.
 This is particularly useful for user services that need access to session information.
+.TP
+\fBcatlog\fR
+Show the contents of the log buffer for the named service.
+This is possible only if the log type of the service is set to \fBbuffer\fR.
+If the log is truncated or appears incomplete, a warning message follows the output.
+If the \fB\-\-clear\fR option is specified, the buffer is cleared after displaying its contents. 
+.TP
+\fBsignal\fR
+Send a signal to the process associated with the specified service.
+The \fIsignal-id\fR can either be specified as an integer or signal name (standard POSIX name
+minus the \fBSIG\fR- prefix; a limited selection of signal names are recognised, including
+\fBTERM\fR, \fBHUP\fR, and \fBKILL\fR).
+The \fB--list\fR (\fB-l\fR) option can be used (without \fIsignal-id\fR and \fIservice-name\fR)
+to list the full set of supported signal names.
 .\"
 .SH SERVICE OPERATION
 .\"
